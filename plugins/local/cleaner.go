@@ -32,7 +32,7 @@ func NewCleanerPlugin() *CleanerPlugin {
 }
 
 // Scan 执行系统痕迹清理 - 直接、简单
-func (p *CleanerPlugin) Scan(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *plugins.Result {
+func (p *CleanerPlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *plugins.Result {
 	var output strings.Builder
 	var filesCleared, dirsCleared, sysCleared int
 
@@ -44,7 +44,7 @@ func (p *CleanerPlugin) Scan(ctx context.Context, info *common.HostInfo, config 
 	for _, file := range files {
 		if p.removeFile(file) {
 			filesCleared++
-			output.WriteString(fmt.Sprintf("清理文件: %s\n", file))
+			_, _ = fmt.Fprintf(&output, "清理文件: %s\n", file)
 		}
 	}
 
@@ -53,7 +53,7 @@ func (p *CleanerPlugin) Scan(ctx context.Context, info *common.HostInfo, config 
 	for _, file := range tempFiles {
 		if p.removeFile(file) {
 			filesCleared++
-			output.WriteString(fmt.Sprintf("清理临时文件: %s\n", file))
+			_, _ = fmt.Fprintf(&output, "清理临时文件: %s\n", file)
 		}
 	}
 

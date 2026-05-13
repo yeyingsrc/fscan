@@ -37,7 +37,9 @@ func NewForwardShellPlugin() *ForwardShellPlugin {
 }
 
 // Scan 执行正向Shell服务 - 直接实现
-func (p *ForwardShellPlugin) Scan(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *plugins.Result {
+func (p *ForwardShellPlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *plugins.Result {
+	config := session.Config
+	state := session.State
 	var output strings.Builder
 
 	// 从config获取配置
@@ -114,13 +116,19 @@ func (p *ForwardShellPlugin) startForwardShellServer(ctx context.Context, port i
 		}
 
 		common.LogSuccess(i18n.Tr("forwardshell_client_connected", conn.RemoteAddr().String()))
-		go p.handleClient(conn)
+		go p.handleClient(ctx, conn)
 	}
 }
 
 // handleClient 处理客户端连接
-func (p *ForwardShellPlugin) handleClient(clientConn net.Conn) {
+func (p *ForwardShellPlugin) handleClient(ctx context.Context, clientConn net.Conn) {
 	defer func() { _ = clientConn.Close() }()
+
+	// ctx 取消时关闭连接，解除阻塞的读操作
+	go func() {
+		<-ctx.Done()
+		_ = clientConn.Close()
+	}()
 
 	// 发送欢迎信息
 	welcome := fmt.Sprintf("FScan Forward Shell - %s\nType 'exit' to disconnect\n\n", runtime.GOOS)
@@ -145,7 +153,7 @@ func (p *ForwardShellPlugin) handleClient(clientConn net.Conn) {
 		p.executeCommand(clientConn, command)
 	}
 
-	if err := scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil && ctx.Err() == nil {
 		common.LogError(i18n.Tr("forwardshell_read_failed", err))
 	}
 }

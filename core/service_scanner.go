@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -27,7 +28,7 @@ func NewServiceScanStrategy() *ServiceScanStrategy {
 func (s *ServiceScanStrategy) LogPluginInfo(config *common.Config) {
 	// 需要从命令行参数获取端口信息来进行过滤
 	// 如果没有指定端口，使用默认端口进行过滤显示
-	ports := common.GetFlagVars().Ports
+	ports := config.Target.Ports
 	if ports == "" || ports == "all" {
 		// 默认端口扫描：显示所有插件
 		s.BaseScanStrategy.LogPluginInfo(config)
@@ -42,7 +43,7 @@ func (s *ServiceScanStrategy) showPluginsForSpecifiedPorts(config *common.Config
 	allPlugins, isCustomMode := s.GetPlugins(config)
 
 	// 解析端口
-	ports := s.parsePortList(common.GetFlagVars().Ports)
+	ports := s.parsePortList(config.Target.Ports)
 	if len(ports) == 0 {
 		s.BaseScanStrategy.LogPluginInfo(config)
 		return
@@ -112,10 +113,11 @@ func (s *ServiceScanStrategy) Description() string {
 }
 
 // Execute 执行服务扫描策略
-func (s *ServiceScanStrategy) Execute(config *common.Config, state *common.State, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
+func (s *ServiceScanStrategy) Execute(ctx context.Context, session *common.ScanSession, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
+	config := session.Config
+
 	// 验证扫描目标（需要同时检查 -h 和 -hf 参数）
-	fv := common.GetFlagVars()
-	if info.Host == "" && fv.HostsFile == "" {
+	if info.Host == "" && session.Params.HostsFile == "" {
 		common.LogError(i18n.GetText("parse_error_target_empty"))
 		return
 	}
@@ -133,28 +135,88 @@ func (s *ServiceScanStrategy) Execute(config *common.Config, state *common.State
 	s.LogPluginInfo(config)
 
 	// 执行主机扫描流程
-	s.performHostScan(config, state, info, ch, wg)
+	s.performHostScan(ctx, session, info, ch, wg)
 }
 
 // performHostScan 执行主机扫描的完整流程
-func (s *ServiceScanStrategy) performHostScan(config *common.Config, state *common.State, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
-	// 发现目标主机和端口
-	targetInfos, err := s.discoverTargets(info.Host, info, config, state)
+// pipeline 模式：端口扫描和插件执行并行，扫到开放端口立即开始跑插件
+func (s *ServiceScanStrategy) performHostScan(ctx context.Context, session *common.ScanSession, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
+	config := session.Config
+	state := session.State
+
+	// 解析目标主机
+	hosts, err := parsers.ParseIP(info.Host, session.Params.HostsFile, session.Params.ExcludeHosts)
 	if err != nil {
-		common.LogError(err.Error())
+		common.LogError(fmt.Sprintf("%s: %v", i18n.GetText("parse_target_failed"), err))
 		return
 	}
 
-	// 执行漏洞扫描
-	if len(targetInfos) > 0 {
-		ExecuteScanTasks(config, state, targetInfos, s, ch, wg)
+	// 主机存活检测
+	if s.shouldPerformLivenessCheck(hosts, config) {
+		hosts = CheckLive(ctx, hosts, false, session)
+		common.LogInfo(i18n.Tr("alive_hosts_count_info", len(hosts)))
+	}
+
+	if len(hosts) == 0 && len(state.GetHostPorts()) == 0 {
+		return
+	}
+
+	// 流式 channel：端口扫描发现开放端口后立即通知插件执行
+	stream := make(chan string, 64)
+
+	// 启动端口扫描 goroutine
+	go func() {
+		if len(hosts) > 0 {
+			EnhancedPortScan(ctx, hosts, config.Target.Ports, int64(config.Timeout.Seconds()), session, stream)
+		} else {
+			close(stream)
+		}
+	}()
+
+	// pipeline 消费：边收开放端口边执行插件
+	pluginsToRun, isCustomMode := s.GetPlugins(config)
+	cancelled := false
+	for addr := range stream {
+		if cancelled {
+			continue // ctx 已取消，排空 stream 防止写端阻塞
+		}
+		select {
+		case <-ctx.Done():
+			cancelled = true
+			continue
+		default:
+		}
+
+		infos := s.convertToTargetInfos([]string{addr}, info)
+		for _, target := range infos {
+			for _, pluginName := range pluginsToRun {
+				if s.IsPluginApplicableByName(pluginName, target.Host, target.Port, isCustomMode, config) {
+					executeScanTask(ctx, session, pluginName, target, ch, wg)
+				}
+			}
+		}
+	}
+
+	// 合并预设的 host:port
+	hostPorts := state.GetHostPorts()
+	if len(hostPorts) > 0 {
+		merged := mergeHostPorts(nil, hostPorts)
+		targets := s.convertToTargetInfos(merged, info)
+		for _, target := range targets {
+			for _, pluginName := range pluginsToRun {
+				if s.IsPluginApplicableByName(pluginName, target.Host, target.Port, isCustomMode, config) {
+					executeScanTask(ctx, session, pluginName, target, ch, wg)
+				}
+			}
+		}
+		state.ClearHostPorts()
 	}
 }
 
 // PrepareTargets 准备目标信息
-func (s *ServiceScanStrategy) PrepareTargets(info common.HostInfo, config *common.Config, state *common.State) []common.HostInfo {
+func (s *ServiceScanStrategy) PrepareTargets(info common.HostInfo, session *common.ScanSession) []common.HostInfo {
 	// 发现目标主机和端口
-	targetInfos, err := s.discoverTargets(info.Host, info, config, state)
+	targetInfos, err := s.discoverTargets(context.Background(), info.Host, info, session)
 	if err != nil {
 		common.LogError(err.Error())
 		return nil
@@ -213,10 +275,11 @@ func (s *ServiceScanStrategy) LogVulnerabilityPluginInfo(targets []common.HostIn
 // =============================================================================
 
 // discoverTargets 发现目标主机和端口
-func (s *ServiceScanStrategy) discoverTargets(hostInput string, baseInfo common.HostInfo, config *common.Config, state *common.State) ([]common.HostInfo, error) {
+func (s *ServiceScanStrategy) discoverTargets(ctx context.Context, hostInput string, baseInfo common.HostInfo, session *common.ScanSession) ([]common.HostInfo, error) {
+	config := session.Config
+	state := session.State
 	// 标准流程：解析目标主机
-	fv := common.GetFlagVars()
-	hosts, err := parsers.ParseIP(hostInput, fv.HostsFile, fv.ExcludeHosts)
+	hosts, err := parsers.ParseIP(hostInput, session.Params.HostsFile, session.Params.ExcludeHosts)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", i18n.GetText("parse_target_failed"), err)
 	}
@@ -227,12 +290,12 @@ func (s *ServiceScanStrategy) discoverTargets(hostInput string, baseInfo common.
 	if len(hosts) > 0 || len(state.GetHostPorts()) > 0 {
 		// 主机存活检测
 		if s.shouldPerformLivenessCheck(hosts, config) {
-			hosts = CheckLive(hosts, false, config, state)
+			hosts = CheckLive(ctx, hosts, false, session)
 			common.LogInfo(i18n.Tr("alive_hosts_count_info", len(hosts)))
 		}
 
 		// 端口扫描
-		alivePorts := s.discoverAlivePorts(hosts, config, state)
+		alivePorts := s.discoverAlivePorts(ctx, hosts, session)
 		if len(alivePorts) > 0 {
 			targetInfos = s.convertToTargetInfos(alivePorts, baseInfo)
 		}
@@ -247,24 +310,42 @@ func (s *ServiceScanStrategy) shouldPerformLivenessCheck(hosts []string, config 
 }
 
 // discoverAlivePorts 发现存活的端口
-func (s *ServiceScanStrategy) discoverAlivePorts(hosts []string, config *common.Config, state *common.State) []string {
+// 执行正常端口扫描后，合并预设的 host:port（来自项目缓存或 CLI），确保不遗漏
+func (s *ServiceScanStrategy) discoverAlivePorts(ctx context.Context, hosts []string, session *common.ScanSession) []string {
+	config := session.Config
+	state := session.State
 	var alivePorts []string
 
-	// 如果已经有明确指定的host:port，直接使用（让后续SmartIdentify统一验证和识别）
-	hostPorts := state.GetHostPorts()
-	if len(hostPorts) > 0 {
-		alivePorts = hostPorts
-		common.LogInfo(i18n.Tr("alive_ports_count", len(alivePorts)))
-		state.ClearHostPorts()
-		return alivePorts
+	// 正常端口扫描
+	if len(hosts) > 0 {
+		alivePorts = EnhancedPortScan(ctx, hosts, config.Target.Ports, int64(config.Timeout.Seconds()), session, nil)
 	}
 
-	// 根据扫描模式选择端口扫描方式
-	if len(hosts) > 0 {
-		alivePorts = EnhancedPortScan(hosts, config.Target.Ports, int64(config.Timeout.Seconds()), config, state)
+	// 合并预设的 host:port（项目缓存 / CLI 注入）
+	hostPorts := state.GetHostPorts()
+	if len(hostPorts) > 0 {
+		alivePorts = mergeHostPorts(alivePorts, hostPorts)
+		common.LogInfo(i18n.Tr("alive_ports_count", len(alivePorts)))
+		state.ClearHostPorts()
 	}
 
 	return alivePorts
+}
+
+// mergeHostPorts 合并两个 host:port 列表并去重
+func mergeHostPorts(a, b []string) []string {
+	seen := make(map[string]struct{}, len(a)+len(b))
+	for _, s := range a {
+		seen[s] = struct{}{}
+	}
+	for _, s := range b {
+		seen[s] = struct{}{}
+	}
+	result := make([]string, 0, len(seen))
+	for s := range seen {
+		result = append(result, s)
+	}
+	return result
 }
 
 // convertToTargetInfos 将端口列表转换为目标信息

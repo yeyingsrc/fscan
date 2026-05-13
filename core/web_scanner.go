@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -18,6 +19,25 @@ import (
 // Web服务检测
 // ===============================
 
+// 全局共享 HTTP Client，复用连接池减少 TLS 握手和 TCP 建连开销
+var (
+	sharedHTTPClientOnce sync.Once
+	sharedHTTPClient     *http.Client
+)
+
+func getSharedHTTPClient(config *common.Config) *http.Client {
+	sharedHTTPClientOnce.Do(func() {
+		sharedHTTPClient = createHTTPClient(config)
+		// 启用 keep-alive 复用连接
+		if t, ok := sharedHTTPClient.Transport.(*http.Transport); ok {
+			t.DisableKeepAlives = false
+			t.MaxIdleConns = 100
+			t.MaxIdleConnsPerHost = 2
+		}
+	})
+	return sharedHTTPClient
+}
+
 // WebPortDetector 简化的Web检测器 - 保持API兼容
 type WebPortDetector struct{}
 
@@ -29,9 +49,9 @@ func GetWebPortDetector() *WebPortDetector {
 // DetectHTTPScheme 智能检测HTTP/HTTPS协议
 // 策略：TLS握手优先（快速且准确），失败后尝试HTTP
 // 返回: "https", "http", 或 "" (都不是Web服务)
-func DetectHTTPScheme(host string, port int, config *common.Config) string {
+func DetectHTTPScheme(host string, port int, config *common.Config, session *common.ScanSession) string {
 	// 优化：先快速检测 TCP 连通性
-	if !isPortReachable(host, port, config) {
+	if !isPortReachable(host, port, config, session) {
 		return ""
 	}
 
@@ -58,15 +78,7 @@ func DetectHTTPScheme(host string, port int, config *common.Config) string {
 	// TLS握手失败，记录原因
 
 	// 第二步：尝试HTTP请求（回退检测HTTP）
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DisableKeepAlives: true,
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse // 不跟随重定向
-		},
-	}
+	client := getSharedHTTPClient(config)
 
 	// 使用HEAD请求（更轻量）
 	httpURL := fmt.Sprintf("http://%s", addr)
@@ -124,14 +136,14 @@ func createHTTPClient(config *common.Config) *http.Client {
 }
 
 // DetectHTTPServiceOnly HTTP协议检测 - 保持API兼容，简化实现
-func (w *WebPortDetector) DetectHTTPServiceOnly(host string, port int, config *common.Config) bool {
+func (w *WebPortDetector) DetectHTTPServiceOnly(host string, port int, config *common.Config, session *common.ScanSession) bool {
 	// 优化：先快速检测 TCP 连通性，避免在不可达端口上浪费双倍超时时间
 	// 对于不存在的端口，这可以将检测时间从 2×timeout 减少到 1×timeout
-	if !isPortReachable(host, port, config) {
+	if !isPortReachable(host, port, config, session) {
 		return false
 	}
 
-	client := createHTTPClient(config)
+	client := getSharedHTTPClient(config)
 
 	// 尝试HTTP
 	if w.tryHTTP(client, host, port, "http") {
@@ -148,11 +160,11 @@ func (w *WebPortDetector) DetectHTTPServiceOnly(host string, port int, config *c
 
 // isPortReachable 快速检测端口是否可达（TCP 连接测试）
 // 用于在 HTTP/HTTPS 检测前过滤不可达端口，避免双重超时
-func isPortReachable(host string, port int, config *common.Config) bool {
+func isPortReachable(host string, port int, config *common.Config, session *common.ScanSession) bool {
 	timeout := config.Network.WebTimeout
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	conn, err := session.DialTCP(context.Background(), "tcp", addr, timeout)
 	if err != nil {
 		return false
 	}
@@ -277,30 +289,6 @@ func IsMarkedWebService(host string, port int) bool {
 }
 
 // ===============================
-// 指纹缓存
-// ===============================
-
-// 指纹缓存 - 存储 host:port → 指纹列表的映射
-var (
-	fingerprintCache      = make(map[string][]string)
-	fingerprintCacheMutex sync.RWMutex
-)
-
-// SetFingerprints 存储目标的指纹信息
-func SetFingerprints(host string, port int, fingerprints []string) {
-	if len(fingerprints) == 0 {
-		return
-	}
-
-	cacheKey := fmt.Sprintf("%s:%d", host, port)
-
-	fingerprintCacheMutex.Lock()
-	defer fingerprintCacheMutex.Unlock()
-
-	fingerprintCache[cacheKey] = fingerprints
-}
-
-// ===============================
 // Web扫描策略
 // ===============================
 
@@ -327,7 +315,7 @@ func (s *WebScanStrategy) Description() string {
 }
 
 // Execute 执行Web扫描策略
-func (s *WebScanStrategy) Execute(config *common.Config, state *common.State, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
+func (s *WebScanStrategy) Execute(ctx context.Context, session *common.ScanSession, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
 	// 输出扫描开始信息
 	s.LogScanStart()
 
@@ -338,13 +326,13 @@ func (s *WebScanStrategy) Execute(config *common.Config, state *common.State, in
 	}
 
 	// 准备URL目标
-	targets := s.PrepareTargets(info, state)
+	targets := s.PrepareTargets(info, session.State)
 
 	// 输出插件信息
-	s.LogPluginInfo(config)
+	s.LogPluginInfo(session.Config)
 
 	// 执行扫描任务
-	ExecuteScanTasks(config, state, targets, s, ch, wg)
+	ExecuteScanTasks(ctx, session, targets, s, ch, wg)
 }
 
 // PrepareTargets 准备URL目标列表

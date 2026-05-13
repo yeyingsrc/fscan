@@ -27,7 +27,11 @@ func getGlobalLogger() *logging.Logger {
 			EnableColor:  !fv.NoColor,
 			SlowOutput:   false,
 			ShowProgress: !fv.DisableProgress,
+			Silent:       fv.Silent,
 			StartTime:    GetGlobalState().GetStartTime(),
+		}
+		if fv.Debug {
+			config.DebugLogFile = "fscan_debug.log"
 		}
 		globalLogger = logging.NewLogger(config)
 		globalLogger.SetCoordinatedOutput(LogWithProgress)
@@ -77,3 +81,10 @@ func LogVuln(result string) { getGlobalLogger().Vuln(result) }
 
 // LogError 输出错误日志
 func LogError(errMsg string) { getGlobalLogger().Error(errMsg) }
+
+// CloseLogger 关闭日志系统，释放文件资源
+func CloseLogger() {
+	if globalLogger != nil {
+		globalLogger.Close()
+	}
+}

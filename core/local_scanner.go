@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"sync"
 
 	"github.com/shadow1ng/fscan/common"
@@ -41,7 +42,9 @@ func (s *LocalScanStrategy) Description() string {
 }
 
 // Execute 执行本地扫描策略
-func (s *LocalScanStrategy) Execute(config *common.Config, state *common.State, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
+func (s *LocalScanStrategy) Execute(ctx context.Context, session *common.ScanSession, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
+	config := session.Config
+
 	// 输出扫描开始信息
 	s.LogScanStart()
 
@@ -66,7 +69,7 @@ func (s *LocalScanStrategy) Execute(config *common.Config, state *common.State, 
 	targets := s.PrepareTargets(info)
 
 	// 执行扫描任务
-	ExecuteScanTasks(config, state, targets, s, ch, wg)
+	ExecuteScanTasks(ctx, session, targets, s, ch, wg)
 }
 
 // PrepareTargets 准备本地扫描目标

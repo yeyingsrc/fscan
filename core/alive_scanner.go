@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -53,27 +54,24 @@ func (s *AliveScanStrategy) Description() string {
 }
 
 // Execute 执行存活探测扫描策略
-func (s *AliveScanStrategy) Execute(config *common.Config, state *common.State, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
+func (s *AliveScanStrategy) Execute(ctx context.Context, session *common.ScanSession, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
 	// 验证扫描目标（需要同时检查 -h 和 -hf 参数）
-	fv := common.GetFlagVars()
-	if info.Host == "" && fv.HostsFile == "" {
+	if info.Host == "" && session.Params.HostsFile == "" {
 		common.LogError(i18n.GetText("parse_error_target_empty"))
 		return
 	}
 
-
 	// 执行存活探测
-	s.performAliveScan(info, config, state)
+	s.performAliveScan(ctx, info, session)
 
 	// 输出统计信息
 	s.outputStats()
 }
 
 // performAliveScan 执行存活探测
-func (s *AliveScanStrategy) performAliveScan(info common.HostInfo, config *common.Config, state *common.State) {
+func (s *AliveScanStrategy) performAliveScan(ctx context.Context, info common.HostInfo, session *common.ScanSession) {
 	// 解析目标主机
-	fv := common.GetFlagVars()
-	hosts, err := parsers.ParseIP(info.Host, fv.HostsFile, fv.ExcludeHosts)
+	hosts, err := parsers.ParseIP(info.Host, session.Params.HostsFile, session.Params.ExcludeHosts)
 	if err != nil {
 		common.LogError(i18n.Tr("parse_target_failed", err))
 		return
@@ -91,7 +89,7 @@ func (s *AliveScanStrategy) performAliveScan(info common.HostInfo, config *commo
 
 
 	// 执行存活检测
-	aliveList := CheckLive(hosts, false, config, state) // 使用ICMP探测
+	aliveList := CheckLive(ctx, hosts, false, session) // 使用ICMP探测
 
 	// 更新统计信息
 	s.stats.AliveHosts = len(aliveList)

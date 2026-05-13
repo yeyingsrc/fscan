@@ -201,10 +201,10 @@ var (
 )
 
 // probeTarget 探测目标SMB信息（协议版本、系统信息）
-func probeTarget(host string, port int, timeout time.Duration) (*SMBTarget, error) {
+func probeTarget(ctx context.Context, host string, port int, timeout time.Duration, session *common.ScanSession) (*SMBTarget, error) {
 	target := fmt.Sprintf("%s:%d", host, port)
 
-	conn, err := common.WrapperTcpWithTimeout("tcp", target, timeout)
+	conn, err := session.DialTCP(ctx, "tcp", target, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("连接失败: %w", err)
 	}
@@ -230,7 +230,7 @@ func probeTarget(host string, port int, timeout time.Duration) (*SMBTarget, erro
 	}
 
 	// SMBv2路径
-	return probeSMBv2(target, timeout)
+	return probeSMBv2(ctx, target, timeout, session)
 }
 
 // probeSMBv1 处理SMBv1协议信息收集
@@ -242,7 +242,7 @@ func probeSMBv1(conn net.Conn, target string, timeout time.Duration) (*SMBTarget
 	}
 
 	ret, err := readSMBMessage(conn)
-	if err != nil || len(ret) < 45 {
+	if err != nil || len(ret) < 47 {
 		return nil, fmt.Errorf("读取SMBv1 Session Setup响应失败: %w", err)
 	}
 
@@ -251,21 +251,24 @@ func probeSMBv1(conn net.Conn, target string, timeout time.Duration) (*SMBTarget
 	}
 
 	// 解析blob信息
-	blobLength := bytesToUint16(ret[43:45])
-	blobCount := bytesToUint16(ret[45:47])
+	blobLength := int(bytesToUint16(ret[43:45]))
+	blobCount := int(bytesToUint16(ret[45:47]))
 
-	if int(blobCount) > len(ret) {
+	gssNative := ret[47:]
+	gssLen := len(gssNative)
+
+	// 校验远端返回的偏移量
+	if blobLength > gssLen || blobCount > gssLen || blobLength > blobCount {
 		return info, nil
 	}
 
-	gssNative := ret[47:]
 	offNTLM := bytes.Index(gssNative, []byte("NTLMSSP"))
 	if offNTLM == -1 {
 		return info, nil
 	}
 
 	// 提取native OS和LM信息
-	native := gssNative[int(blobLength):blobCount]
+	native := gssNative[blobLength:blobCount]
 	ss := strings.Split(string(native), "\x00\x00")
 
 	if len(ss) > 0 {
@@ -276,15 +279,17 @@ func probeSMBv1(conn net.Conn, target string, timeout time.Duration) (*SMBTarget
 	}
 
 	// 解析NTLM信息
-	bs := gssNative[offNTLM:blobLength]
-	parseNTLMChallenge(bs, info)
+	if offNTLM <= blobLength {
+		bs := gssNative[offNTLM:blobLength]
+		parseNTLMChallenge(bs, info)
+	}
 
 	return info, nil
 }
 
 // probeSMBv2 处理SMBv2协议信息收集
-func probeSMBv2(target string, timeout time.Duration) (*SMBTarget, error) {
-	conn2, err := common.WrapperTcpWithTimeout("tcp", target, timeout)
+func probeSMBv2(ctx context.Context, target string, timeout time.Duration, session *common.ScanSession) (*SMBTarget, error) {
+	conn2, err := session.DialTCP(ctx, "tcp", target, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("SMBv2连接失败: %w", err)
 	}
@@ -349,10 +354,10 @@ func probeSMBv2(target string, timeout time.Duration) (*SMBTarget, error) {
 }
 
 // checkSMBGhost 检测CVE-2020-0796漏洞
-func checkSMBGhost(host string, timeout time.Duration) bool {
+func checkSMBGhost(ctx context.Context, host string, timeout time.Duration, session *common.ScanSession) bool {
 	addr := fmt.Sprintf("%s:445", host)
 
-	conn, err := common.WrapperTcpWithTimeout("tcp", addr, timeout)
+	conn, err := session.DialTCP(ctx, "tcp", addr, timeout)
 	if err != nil {
 		return false
 	}
@@ -385,15 +390,15 @@ func checkSMBGhost(host string, timeout time.Duration) bool {
 
 // SMBAuthenticator 统一认证接口
 type SMBAuthenticator interface {
-	Authenticate(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration) (*AuthResult, error)
-	ListShares(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration) ([]string, error)
+	Authenticate(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration, session *common.ScanSession) (*AuthResult, error)
+	ListShares(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration, session *common.ScanSession) ([]string, error)
 }
 
 // SMB1Authenticator SMB1认证器
 type SMB1Authenticator struct{}
 
 // Authenticate 执行SMB1认证
-func (a *SMB1Authenticator) Authenticate(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration) (*AuthResult, error) {
+func (a *SMB1Authenticator) Authenticate(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration, session *common.ScanSession) (*AuthResult, error) {
 	options := smb.Options{
 		Host:        host,
 		Port:        port,
@@ -467,19 +472,19 @@ func (a *SMB1Authenticator) Authenticate(ctx context.Context, host string, port 
 }
 
 // ListShares 列举SMB共享（SMB1使用SMB2库列举）
-func (a *SMB1Authenticator) ListShares(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration) ([]string, error) {
-	return listSMBSharesInternal(host, port, cred, domain, timeout)
+func (a *SMB1Authenticator) ListShares(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration, session *common.ScanSession) ([]string, error) {
+	return listSMBSharesInternal(ctx, host, port, cred, domain, timeout, session)
 }
 
 // SMB2Authenticator SMB2认证器
 type SMB2Authenticator struct{}
 
 // Authenticate 执行SMB2认证
-func (a *SMB2Authenticator) Authenticate(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration) (*AuthResult, error) {
+func (a *SMB2Authenticator) Authenticate(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration, session *common.ScanSession) (*AuthResult, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	conn, err := common.WrapperTcpWithTimeout("tcp", fmt.Sprintf("%s:%d", host, port), timeout)
+	conn, err := session.DialTCP(ctx, "tcp", fmt.Sprintf("%s:%d", host, port), timeout)
 	if err != nil {
 		return &AuthResult{
 			Success:   false,
@@ -518,15 +523,15 @@ func (a *SMB2Authenticator) Authenticate(ctx context.Context, host string, port 
 }
 
 // ListShares 列举SMB2共享
-func (a *SMB2Authenticator) ListShares(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration) ([]string, error) {
-	return listSMBSharesInternal(host, port, cred, domain, timeout)
+func (a *SMB2Authenticator) ListShares(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration, session *common.ScanSession) ([]string, error) {
+	return listSMBSharesInternal(ctx, host, port, cred, domain, timeout, session)
 }
 
 // listSMBSharesInternal 内部共享列举实现
-func listSMBSharesInternal(host string, port int, cred Credential, domain string, timeout time.Duration) ([]string, error) {
+func listSMBSharesInternal(ctx context.Context, host string, port int, cred Credential, domain string, timeout time.Duration, session *common.ScanSession) ([]string, error) {
 	target := net.JoinHostPort(host, strconv.Itoa(port))
 
-	conn, err := net.DialTimeout("tcp", target, timeout*2)
+	conn, err := session.DialTCP(ctx, "tcp", target, timeout*2)
 	if err != nil {
 		return nil, err
 	}

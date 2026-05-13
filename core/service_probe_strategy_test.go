@@ -13,6 +13,7 @@ service_probe_strategy_test.go - SmartProbeStrategy 策略逻辑测试
 */
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -155,7 +156,7 @@ func TestSmartPortInfoScanner_Creation(t *testing.T) {
 	}
 
 	// 使用 nil 连接（实际测试中会使用真实连接）
-	scanner := NewSmartPortInfoScanner("127.0.0.1", 80, nil, 3*time.Second, config)
+	scanner := NewSmartPortInfoScanner(context.Background(), "127.0.0.1", 80, nil, 3*time.Second, config, nil)
 
 	if scanner == nil {
 		t.Fatal("Scanner 创建失败")
@@ -175,8 +176,8 @@ func TestSmartPortInfoScanner_Creation(t *testing.T) {
 // TestDefaultConstants 验证默认常量值
 func TestDefaultConstants(t *testing.T) {
 	// 验证默认等待时间
-	if defaultTotalWaitMS != 6000 {
-		t.Errorf("defaultTotalWaitMS 应该是 6000，实际是 %d", defaultTotalWaitMS)
+	if defaultTotalWaitMS != 3000 {
+		t.Errorf("defaultTotalWaitMS 应该是 3000，实际是 %d", defaultTotalWaitMS)
 	}
 
 	// 验证默认 intensity

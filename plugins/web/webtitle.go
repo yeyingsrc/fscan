@@ -39,8 +39,9 @@ func NewWebTitlePlugin() *WebTitlePlugin {
 }
 
 // Scan 执行WebTitle扫描
-func (p *WebTitlePlugin) Scan(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *WebScanResult {
-	title, status, length, server, fingerprints, url, err := p.getWebTitle(ctx, info, config)
+func (p *WebTitlePlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *WebScanResult {
+	config := session.Config
+	title, status, length, server, fingerprints, url, err := p.getWebTitle(ctx, info, config, session)
 	if err != nil {
 		return &WebScanResult{
 			Success: false,
@@ -71,6 +72,7 @@ func (p *WebTitlePlugin) Scan(ctx context.Context, info *common.HostInfo, config
 	return &WebScanResult{
 		Type:         plugins.ResultTypeWeb,
 		Success:      true,
+		Output:       url,
 		Title:        title,
 		Status:       status,
 		Server:       server,
@@ -78,9 +80,9 @@ func (p *WebTitlePlugin) Scan(ctx context.Context, info *common.HostInfo, config
 	}
 }
 
-func (p *WebTitlePlugin) getWebTitle(ctx context.Context, info *common.HostInfo, config *common.Config) (string, int, int, string, []string, string, error) {
+func (p *WebTitlePlugin) getWebTitle(ctx context.Context, info *common.HostInfo, config *common.Config, session *common.ScanSession) (string, int, int, string, []string, string, error) {
 	// 智能协议检测
-	protocol := p.detectProtocol(info, config)
+	protocol := p.detectProtocol(info, config, session)
 	baseURL := fmt.Sprintf("%s://%s:%d", protocol, info.Host, info.Port)
 
 	// 构建显示用URL（隐藏标准端口）
@@ -159,7 +161,7 @@ func (p *WebTitlePlugin) getWebTitle(ctx context.Context, info *common.HostInfo,
 	}
 
 	// 执行指纹识别（合并原始响应和跳转后响应的指纹）
-	fingerprints := p.identifyFingerprintsMulti(info, baseURL, checkDataList, config)
+	fingerprints := p.identifyFingerprintsMulti(ctx, info, baseURL, checkDataList, config)
 
 	return title, statusCode, contentLen, server, fingerprints, displayURL, nil
 }
@@ -188,25 +190,20 @@ func (p *WebTitlePlugin) resolveRedirectURL(baseURL, location string) string {
 }
 
 // identifyFingerprintsMulti 识别多个响应的指纹并合并
-func (p *WebTitlePlugin) identifyFingerprintsMulti(info *common.HostInfo, baseURL string, checkDataList []WebScan.CheckDatas, config *common.Config) []string {
+func (p *WebTitlePlugin) identifyFingerprintsMulti(ctx context.Context, info *common.HostInfo, baseURL string, checkDataList []WebScan.CheckDatas, config *common.Config) []string {
 	// 调用指纹识别
 	fingerprints := WebScan.InfoCheck(baseURL, &checkDataList)
 
-	// 存入缓存
-	if len(fingerprints) > 0 {
-		core.SetFingerprints(info.Host, info.Port, fingerprints)
-	}
-
 	// 非全量模式下，基于指纹触发POC扫描
 	if !config.POC.Full && !config.POC.Disabled {
-		p.triggerPocScan(info, fingerprints, config)
+		p.triggerPocScan(ctx, info, fingerprints, config)
 	}
 
 	return fingerprints
 }
 
 // triggerPocScan 基于指纹触发POC扫描
-func (p *WebTitlePlugin) triggerPocScan(info *common.HostInfo, fingerprints []string, config *common.Config) {
+func (p *WebTitlePlugin) triggerPocScan(ctx context.Context, info *common.HostInfo, fingerprints []string, config *common.Config) {
 	target := info.Target()
 
 	// 无指纹，跳过
@@ -224,7 +221,7 @@ func (p *WebTitlePlugin) triggerPocScan(info *common.HostInfo, fingerprints []st
 	// 基于指纹执行POC扫描
 	common.LogDebug(fmt.Sprintf("WebTitle %s 触发指纹POC扫描: %v", target, fingerprints))
 	info.Info = fingerprints
-	WebScan.WebScan(info, config)
+	WebScan.WebScan(ctx, info, config)
 }
 
 // formatHeaders 将 HTTP Header 格式化为字符串
@@ -239,7 +236,7 @@ func (p *WebTitlePlugin) formatHeaders(headers http.Header) string {
 }
 
 // detectProtocol 智能检测HTTP/HTTPS协议（基于服务识别和主动探测）
-func (p *WebTitlePlugin) detectProtocol(info *common.HostInfo, config *common.Config) string {
+func (p *WebTitlePlugin) detectProtocol(info *common.HostInfo, config *common.Config, session *common.ScanSession) string {
 	host := info.Host
 	port := info.Port
 
@@ -266,7 +263,7 @@ func (p *WebTitlePlugin) detectProtocol(info *common.HostInfo, config *common.Co
 
 	// 第三优先级：主动协议检测（TLS握手）
 	// 对于-u模式或服务名为普通"http"的情况，进行主动检测确认
-	detected := core.DetectHTTPScheme(host, port, config)
+	detected := core.DetectHTTPScheme(host, port, config, session)
 	if detected != "" {
 		// 缓存检测结果（避免重复检测）
 		if exists {

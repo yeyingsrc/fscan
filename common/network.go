@@ -102,11 +102,9 @@ func createProxyConfig(timeout time.Duration) *proxy.ProxyConfig {
 // TCP 连接
 // =============================================================================
 
-// WrapperTcpWithTimeout TCP连接包装器，带超时
-// 支持通过代理管理器进行SOCKS5和HTTP代理连接，并集成发包控制
-// 使用全局拨号器复用连接，避免重复创建代理握手开销
+// Deprecated: WrapperTcpWithTimeout 仅供 mylib/grdp 兼容使用，新代码请用 ScanSession.DialTCP
 //
-//nolint:revive // 保持向后兼容性，避免破坏大量现有代码
+//nolint:revive
 func WrapperTcpWithTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
 	// 检查发包限制 - 在代理连接前进行控制
 	if canSend, reason := CanSendPacket(); !canSend {
@@ -156,6 +154,11 @@ func IsProxyEnabled() bool {
 // IsProxyReliable 检查代理是否可靠（不存在全回显问题）
 func IsProxyReliable() bool {
 	return proxy.IsProxyReliable()
+}
+
+// IsSOCKS5Proxy 检查当前代理是否为SOCKS5类型
+func IsSOCKS5Proxy() bool {
+	return proxy.IsSOCKS5Proxy()
 }
 
 // SafeHTTPDo 带发包控制的HTTP请求

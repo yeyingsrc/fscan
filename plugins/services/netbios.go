@@ -29,7 +29,9 @@ func NewNetBIOSPlugin() *NetBIOSPlugin {
 // GetPorts 实现Plugin接口
 
 // Scan 执行NetBIOS扫描 - 收集Windows主机和域信息
-func (p *NetBIOSPlugin) Scan(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *ScanResult {
+func (p *NetBIOSPlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *ScanResult {
+	config := session.Config
+	state := session.State
 	target := info.Target()
 
 	// 检查端口类型
@@ -49,7 +51,7 @@ func (p *NetBIOSPlugin) Scan(ctx context.Context, info *common.HostInfo, config 
 		netbiosInfo, err = p.queryNetBIOSNames(info.Host, config, state)
 	} else {
 		// TCP端口139 - NetBIOS会话服务
-		netbiosInfo, err = p.queryNetBIOSSession(info.Host, config)
+		netbiosInfo, err = p.queryNetBIOSSession(ctx, info.Host, session)
 	}
 
 	if err != nil {
@@ -184,16 +186,16 @@ func (p *NetBIOSPlugin) queryNetBIOSNames(host string, config *common.Config, st
 }
 
 // queryNetBIOSSession 查询NetBIOS会话服务(TCP 139)
-func (p *NetBIOSPlugin) queryNetBIOSSession(host string, config *common.Config) (*NetBIOSInfo, error) {
+func (p *NetBIOSPlugin) queryNetBIOSSession(ctx context.Context, host string, session *common.ScanSession) (*NetBIOSInfo, error) {
 	target := fmt.Sprintf("%s:139", host)
 
-	conn, err := common.WrapperTcpWithTimeout("tcp", target, config.Timeout)
+	conn, err := session.DialTCP(ctx, "tcp", target, session.Config.Timeout)
 	if err != nil {
 		return nil, fmt.Errorf("连接NetBIOS会话服务失败: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
-	_ = conn.SetDeadline(time.Now().Add(config.Timeout))
+	_ = conn.SetDeadline(time.Now().Add(session.Config.Timeout))
 
 	// 发送SMB协商数据包
 	smbNegotiate1 := []byte{

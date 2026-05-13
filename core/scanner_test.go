@@ -1,11 +1,13 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
 
 	"github.com/shadow1ng/fscan/common"
+	"github.com/shadow1ng/fscan/plugins"
 )
 
 /*
@@ -33,6 +35,26 @@ scanner_test.go - Scanner核心逻辑测试
 // =============================================================================
 // 核心逻辑测试：策略选择
 // =============================================================================
+
+func TestWebResultSerializerPreservesDetectedProtocol(t *testing.T) {
+	serializer := resultSerializers[plugins.ResultTypeWeb]
+	details := map[string]interface{}{}
+	result := &plugins.Result{
+		Type:    plugins.ResultTypeWeb,
+		Success: true,
+		Output:  "https://192.168.1.1:8443",
+	}
+	info := &common.HostInfo{Host: "192.168.1.1", Port: 8443}
+
+	serializer.fillDetail(result, info, details)
+
+	if details["protocol"] != "https" {
+		t.Fatalf("protocol = %v, 期望 https", details["protocol"])
+	}
+	if details["url"] != "https://192.168.1.1:8443" {
+		t.Fatalf("url = %v, 期望检测出的URL", details["url"])
+	}
+}
 
 // TestSelectStrategy 测试策略选择逻辑
 func TestSelectStrategy(t *testing.T) {
@@ -214,7 +236,7 @@ type mockStrategy struct {
 	applicablePlugins map[string]bool // pluginName -> isApplicable
 }
 
-func (m *mockStrategy) Execute(config *common.Config, state *common.State, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
+func (m *mockStrategy) Execute(_ context.Context, session *common.ScanSession, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
 }
 
 func (m *mockStrategy) GetPlugins() ([]string, bool) {

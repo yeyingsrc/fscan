@@ -24,11 +24,13 @@ func NewOraclePlugin() *OraclePlugin {
 	}
 }
 
-func (p *OraclePlugin) Scan(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *ScanResult {
+func (p *OraclePlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *ScanResult {
+	config := session.Config
+	state := session.State
 	target := info.Target()
 
 	if config.DisableBrute {
-		return p.identifyService(ctx, info, config, state)
+		return p.identifyService(ctx, info, session)
 	}
 
 	// 先测试未授权访问
@@ -48,7 +50,7 @@ func (p *OraclePlugin) Scan(ctx context.Context, info *common.HostInfo, config *
 
 	// 使用公共框架进行并发凭据测试
 	authFn := p.createAuthFunc(info, config, state)
-	testConfig := DefaultConcurrentTestConfig(config)
+	testConfig := DefaultConcurrentTestConfigWithTarget(config, info)
 
 	result := TestCredentialsConcurrently(ctx, credentials, authFn, "oracle", testConfig)
 
@@ -178,10 +180,10 @@ func (p *OraclePlugin) testUnauthorizedAccess(ctx context.Context, info *common.
 	return nil
 }
 
-func (p *OraclePlugin) identifyService(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *ScanResult {
+func (p *OraclePlugin) identifyService(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *ScanResult {
 	target := info.Target()
 
-	conn, err := common.WrapperTcpWithTimeout("tcp", target, config.Timeout)
+	conn, err := session.DialTCP(ctx, "tcp", target, session.Config.Timeout)
 	if err != nil {
 		return &ScanResult{
 			Success: false,

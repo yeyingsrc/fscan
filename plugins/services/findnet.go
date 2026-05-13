@@ -36,7 +36,8 @@ func NewFindNetPlugin() *FindNetPlugin {
 // GetPorts 实现Plugin接口
 
 // Scan 执行FindNet扫描 - Windows网络信息收集
-func (p *FindNetPlugin) Scan(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *ScanResult {
+func (p *FindNetPlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *ScanResult {
+	config := session.Config
 	target := info.Target()
 
 	// 检查是否为RPC端口
@@ -48,10 +49,8 @@ func (p *FindNetPlugin) Scan(ctx context.Context, info *common.HostInfo, config 
 		}
 	}
 
-	// WrapperTcpWithTimeout内部已包含发包限制检查
-	conn, err := common.WrapperTcpWithTimeout("tcp", target, config.Timeout)
+	conn, err := session.DialTCP(ctx, "tcp", target, config.Timeout)
 	if err != nil {
-		state.IncrementTCPFailedPacketCount()
 		return &ScanResult{
 			Success: false,
 			Service: "findnet",
@@ -66,15 +65,12 @@ func (p *FindNetPlugin) Scan(ctx context.Context, info *common.HostInfo, config 
 	// 执行RPC网络发现
 	networkInfo, err := p.performNetworkDiscovery(conn)
 	if err != nil {
-		state.IncrementTCPFailedPacketCount()
 		return &ScanResult{
 			Success: false,
 			Service: "findnet",
 			Error:   err,
 		}
 	}
-
-	state.IncrementTCPSuccessPacketCount()
 
 	// 记录发现的网络信息 (一次性输出，避免被其他日志打断)
 	if networkInfo.Valid {
@@ -169,7 +165,9 @@ func (p *FindNetPlugin) performNetworkDiscovery(conn net.Conn) (*NetworkInfo, er
 	// 查找响应结束标记
 	for i := 0; i < len(responseData)-5; i++ {
 		if bytes.Equal(responseData[i:i+6], rpcBuffer3) {
-			responseData = responseData[:i-4]
+			if i >= 4 {
+				responseData = responseData[:i-4]
+			}
 			break
 		}
 	}

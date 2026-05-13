@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sync"
@@ -50,6 +51,9 @@ type ScanRequest struct {
 	PocName  string `json:"poc_name"`
 	PocFull  bool   `json:"poc_full"`
 	DisablePoc bool `json:"disable_poc"`
+
+	// 项目缓存
+	ProjectID string `json:"project_id,omitempty"`
 }
 
 // ScanStatus 扫描状态响应
@@ -73,7 +77,7 @@ type ScanHandler struct {
 	hub       *ws.Hub
 	state     int32
 	startTime time.Time
-	stopChan  chan struct{}
+	cancelFn  context.CancelFunc
 	mu        sync.RWMutex
 	results   *ResultStore
 }
@@ -122,7 +126,6 @@ func (h *ScanHandler) Start(w http.ResponseWriter, r *http.Request) {
 
 	h.mu.Lock()
 	h.startTime = time.Now()
-	h.stopChan = make(chan struct{})
 	h.mu.Unlock()
 
 	// 清空旧结果
@@ -145,8 +148,18 @@ func (h *ScanHandler) Start(w http.ResponseWriter, r *http.Request) {
 
 // runScan 执行扫描
 func (h *ScanHandler) runScan(req ScanRequest) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	h.mu.Lock()
+	h.cancelFn = cancel
+	h.mu.Unlock()
+
 	defer func() {
-		common.ClearResultCallback() // 清除回调
+		cancel()
+		h.mu.Lock()
+		h.cancelFn = nil
+		h.mu.Unlock()
+		common.ClearResultCallback()
 		atomic.StoreInt32(&h.state, int32(ScanStateIdle))
 		h.hub.Broadcast(ws.MsgScanCompleted, map[string]interface{}{
 			"duration": time.Since(h.startTime).Seconds(),
@@ -172,7 +185,7 @@ func (h *ScanHandler) runScan(req ScanRequest) {
 		fv.ScanMode = "all"
 	}
 	fv.ThreadNum = req.ThreadNum
-	if fv.ThreadNum == 0 {
+	if fv.ThreadNum <= 0 {
 		fv.ThreadNum = 600
 	}
 	fv.TimeoutSec = int64(req.Timeout)
@@ -180,7 +193,7 @@ func (h *ScanHandler) runScan(req ScanRequest) {
 		fv.TimeoutSec = 3
 	}
 	fv.ModuleThreadNum = req.ModuleThreadNum
-	if fv.ModuleThreadNum == 0 {
+	if fv.ModuleThreadNum <= 0 {
 		fv.ModuleThreadNum = 20
 	}
 	fv.DisablePing = req.DisablePing
@@ -196,9 +209,21 @@ func (h *ScanHandler) runScan(req ScanRequest) {
 	fv.DisableSave = true // Web模式不保存到文件
 	fv.Silent = true      // 静默模式
 
-	// 构建Config
+	// 构建Config和Session
 	config := common.BuildConfigFromFlags(fv)
 	state := common.NewState()
+	session := common.NewScanSession(config, state, fv)
+
+	// 过渡桥：全局状态同步（待 Phase 5 移除）
+	common.SetGlobalConfig(config)
+	common.SetGlobalState(state)
+
+	// 项目缓存注入：把已知的 host:port 加入扫描目标
+	if req.ProjectID != "" {
+		if cached := globalProjectStore.CachedHostPorts(req.ProjectID); len(cached) > 0 {
+			state.SetHostPorts(cached)
+		}
+	}
 
 	// 设置WebSocket结果回调
 	common.SetResultCallback(func(result interface{}) {
@@ -209,7 +234,15 @@ func (h *ScanHandler) runScan(req ScanRequest) {
 	})
 
 	// 执行扫描
-	core.RunScan(info, config, state)
+	core.RunScan(ctx, info, session)
+
+	// 项目缓存回写：合并本次扫描结果
+	if req.ProjectID != "" {
+		items := h.results.List()
+		if len(items) > 0 {
+			_ = globalProjectStore.MergeResults(req.ProjectID, items)
+		}
+	}
 }
 
 // Stop 停止扫描
@@ -229,8 +262,8 @@ func (h *ScanHandler) Stop(w http.ResponseWriter, r *http.Request) {
 	atomic.StoreInt32(&h.state, int32(ScanStateStopping))
 
 	h.mu.Lock()
-	if h.stopChan != nil {
-		close(h.stopChan)
+	if h.cancelFn != nil {
+		h.cancelFn()
 	}
 	h.mu.Unlock()
 

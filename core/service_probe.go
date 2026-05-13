@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -15,7 +16,7 @@ import (
 
 // 默认超时时间常量
 const (
-	defaultTotalWaitMS = 6000 // Nmap 默认等待时间
+	defaultTotalWaitMS = 3000 // 服务探测默认等待时间
 	defaultIntensity   = 7    // 默认探测强度 (1-9)
 )
 
@@ -70,13 +71,16 @@ type Service struct {
 
 // Info 定义单个端口探测的上下文信息
 type Info struct {
-	Address       string         // 目标IP地址
-	Port          int            // 目标端口
-	Conn          net.Conn       // 网络连接
-	Result        Result         // 探测结果
-	Found         bool           // 是否成功识别服务
-	config        *common.Config // 配置引用
-	readTimeoutMS int            // 当前读取超时时间（毫秒）
+	Address          string              // 目标IP地址
+	Port             int                 // 目标端口
+	Conn             net.Conn            // 网络连接
+	Result           Result              // 探测结果
+	Found            bool                // 是否成功识别服务
+	ctx              context.Context     // 扫描级 context
+	config           *common.Config      // 配置引用
+	session          *common.ScanSession // 会话引用
+	readTimeoutMS    int                 // 当前读取超时时间（毫秒）
+	maxReadTimeoutMS int                 // RTT 自适应上限（毫秒），0 表示不限制
 }
 
 // SmartPortInfoScanner 智能服务识别器：保持nmap准确性，优化网络交互
@@ -86,24 +90,28 @@ type SmartPortInfoScanner struct {
 	Conn    net.Conn
 	Timeout time.Duration
 	info    *Info
-	config  *common.Config // 配置引用
+	config  *common.Config      // 配置引用
+	session *common.ScanSession // 会话引用
 }
 
 // 预定义的基础探测器已在PortFinger.go中定义，这里不再重复定义
 
 // NewSmartPortInfoScanner 创建智能服务识别器
-func NewSmartPortInfoScanner(addr string, port int, conn net.Conn, timeout time.Duration, config *common.Config) *SmartPortInfoScanner {
+func NewSmartPortInfoScanner(ctx context.Context, addr string, port int, conn net.Conn, timeout time.Duration, config *common.Config, session *common.ScanSession) *SmartPortInfoScanner {
 	return &SmartPortInfoScanner{
 		Address: addr,
 		Port:    port,
 		Conn:    conn,
 		Timeout: timeout,
 		config:  config,
+		session: session,
 		info: &Info{
 			Address: addr,
 			Port:    port,
 			Conn:    conn,
+			ctx:     ctx,
 			config:  config,
+			session: session,
 			Result: Result{
 				Service: Service{},
 			},
@@ -211,9 +219,14 @@ func (s *SmartPortInfoScanner) tryProbeList(probes []*Probe, usedProbes map[stri
 		}
 		usedProbes[probe.Name] = struct{}{}
 
-		probeData, err := DecodeData(probe.Data)
-		if err != nil {
-			continue
+		// 优先使用预解码数据
+		probeData := probe.DecodedData
+		if probeData == nil {
+			var err error
+			probeData, err = DecodeData(probe.Data)
+			if err != nil {
+				continue
+			}
 		}
 
 		// 使用 TotalWaitMS 设置动态超时
@@ -251,7 +264,7 @@ func (s *SmartPortInfoScanner) reconnectIfNeeded() {
 	}
 
 	// 重新建立连接
-	newConn, err := common.WrapperTcpWithTimeout("tcp", fmt.Sprintf("%s:%d", s.Address, s.Port), s.Timeout)
+	newConn, err := s.session.DialTCP(s.info.ctx, "tcp", fmt.Sprintf("%s:%d", s.Address, s.Port), s.Timeout)
 	if err != nil {
 		return
 	}
@@ -274,8 +287,15 @@ func (s *SmartPortInfoScanner) performSSLSecondStage(serviceInfo *ServiceInfo) *
 			continue
 		}
 
-		probeData, err := DecodeData(probe.Data)
-		if err != nil || len(probeData) == 0 {
+		probeData := probe.DecodedData
+		if probeData == nil {
+			var decErr error
+			probeData, decErr = DecodeData(probe.Data)
+			if decErr != nil || len(probeData) == 0 {
+				continue
+			}
+		}
+		if len(probeData) == 0 {
 			continue
 		}
 		response := s.info.Connect(probeData)
@@ -309,8 +329,15 @@ func (s *SmartPortInfoScanner) tryHTTPSProbe() *ServiceInfo {
 		return nil
 	}
 
-	probeData, err := DecodeData(probe.Data)
-	if err != nil || len(probeData) == 0 {
+	probeData := probe.DecodedData
+	if probeData == nil {
+		var decErr error
+		probeData, decErr = DecodeData(probe.Data)
+		if decErr != nil || len(probeData) == 0 {
+			return nil
+		}
+	}
+	if len(probeData) == 0 {
 		return nil
 	}
 	response := s.info.Connect(probeData)
@@ -481,10 +508,14 @@ func (i *Info) setReadTimeout(ms int) {
 
 // getReadTimeout 获取当前读取超时时间
 func (i *Info) getReadTimeout() time.Duration {
+	ms := defaultReadTimeoutMS
 	if i.readTimeoutMS > 0 {
-		return time.Duration(i.readTimeoutMS) * time.Millisecond
+		ms = i.readTimeoutMS
 	}
-	return time.Duration(defaultReadTimeoutMS) * time.Millisecond
+	if i.maxReadTimeoutMS > 0 && ms > i.maxReadTimeoutMS {
+		ms = i.maxReadTimeoutMS
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // WrTimeout 默认读写超时时间(秒)
@@ -511,7 +542,7 @@ func (i *Info) Write(msg []byte) error {
 		_ = oldConn.Close()
 
 		// 尝试重新连接 - 支持SOCKS5代理
-		newConn, retryErr := common.WrapperTcpWithTimeout("tcp", fmt.Sprintf("%s:%d", i.Address, i.Port), time.Duration(6)*time.Second)
+		newConn, retryErr := i.session.DialTCP(i.ctx, "tcp", fmt.Sprintf("%s:%d", i.Address, i.Port), time.Duration(6)*time.Second)
 		if retryErr != nil {
 			return retryErr
 		}

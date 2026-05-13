@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"syscall"
@@ -64,7 +65,8 @@ func main() {
 		os.Exit(130)         // 128 + SIGINT(2) = 130，标准的中断退出码
 	}()
 	defer func() { _ = common.Cleanup() }()
+	defer common.CloseLogger()
 
 	// 执行扫描
-	core.RunScan(*result.Info, result.Config, result.State)
+	core.RunScan(context.Background(), *result.Info, result.Session)
 }

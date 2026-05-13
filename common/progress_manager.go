@@ -48,6 +48,10 @@ type ProgressManager struct {
 
 	// 进度条更新控制（减少 Windows 终端的重复输出）
 	lastRenderedPercent int
+
+	// 引用，避免读全局
+	state   *State
+	noColor bool
 }
 
 // =============================================================================
@@ -102,11 +106,13 @@ func GetProgressManager() *ProgressManager {
 
 // InitProgress 初始化进度条
 func (pm *ProgressManager) InitProgress(total int64, description string) {
-	fv := GetFlagVars()
-	if fv.DisableProgress || fv.Silent {
+	cfg := GetGlobalConfig()
+	if cfg.Output.DisableProgress || cfg.Output.Silent {
 		pm.enabled = false
 		return
 	}
+	pm.state = GetGlobalState()
+	pm.noColor = cfg.Output.NoColor
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -137,16 +143,24 @@ func (pm *ProgressManager) UpdateProgress(increment int64) {
 		return
 	}
 
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	pm.current += increment
-	if pm.current > pm.total {
-		pm.current = pm.total
+	// 原子累加，避免高并发下的锁竞争
+	newCurrent := atomic.AddInt64(&pm.current, increment)
+	if newCurrent > pm.total {
+		atomic.StoreInt64(&pm.current, pm.total)
 	}
 
-	// 更新活跃时间
-	pm.lastActivity = time.Now()
+	// 节流渲染：距上次渲染不足 50ms 则跳过
+	now := time.Now()
+	pm.mu.RLock()
+	lastAct := pm.lastActivity
+	pm.mu.RUnlock()
+	if now.Sub(lastAct) < 50*time.Millisecond {
+		return
+	}
+
+	pm.mu.Lock()
+	pm.lastActivity = now
+	pm.mu.Unlock()
 
 	pm.renderProgress()
 }
@@ -164,7 +178,7 @@ func (pm *ProgressManager) FinishProgress() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	pm.current = pm.total
+	atomic.StoreInt64(&pm.current, pm.total)
 	pm.renderProgress()
 
 	// 停止活跃指示器
@@ -214,11 +228,12 @@ func (pm *ProgressManager) generateProgressBar() string {
 		return base
 	}
 
-	percentage := float64(pm.current) / float64(pm.total) * 100
+	percentage := float64(atomic.LoadInt64(&pm.current)) / float64(pm.total) * 100
 	elapsed := time.Since(pm.startTime)
+	current := atomic.LoadInt64(&pm.current)
 
 	// 计算速度
-	speed := float64(pm.current) / elapsed.Seconds()
+	speed := float64(current) / elapsed.Seconds()
 	speedStr := ""
 	if speed > 0 {
 		speedStr = fmt.Sprintf(" %.0f/s", speed)
@@ -226,8 +241,8 @@ func (pm *ProgressManager) generateProgressBar() string {
 
 	// 计算预估剩余时间
 	var eta string
-	if pm.current > 0 && pm.current < pm.total {
-		totalTime := elapsed * time.Duration(pm.total) / time.Duration(pm.current)
+	if current > 0 && current < pm.total {
+		totalTime := elapsed * time.Duration(pm.total) / time.Duration(current)
 		remaining := totalTime - elapsed
 		if remaining > 0 {
 			eta = fmt.Sprintf(" ETA:%s", formatDuration(remaining))
@@ -239,7 +254,7 @@ func (pm *ProgressManager) generateProgressBar() string {
 
 	// 计算固定部分的宽度
 	fixedPart := fmt.Sprintf("%s %s %5.1f%% [] (%d/%d)%s%s %s",
-		pm.description, spinner, percentage, pm.current, pm.total, speedStr, eta, packetInfo)
+		pm.description, spinner, percentage, current, pm.total, speedStr, eta, packetInfo)
 	fixedWidth := displayWidth(fixedPart)
 
 	// 计算进度条槽位可用宽度（预留2字符余量）
@@ -266,7 +281,7 @@ func (pm *ProgressManager) generateProgressBar() string {
 
 	// 构建最终进度条
 	result := fmt.Sprintf("%s %s %5.1f%% %s (%d/%d)%s%s",
-		pm.description, spinner, percentage, bar, pm.current, pm.total, speedStr, eta)
+		pm.description, spinner, percentage, bar, current, pm.total, speedStr, eta)
 
 	if packetInfo != "" {
 		result += " " + packetInfo
@@ -277,13 +292,16 @@ func (pm *ProgressManager) generateProgressBar() string {
 
 // getPacketInfo 获取发包统计信息（简化版）
 func (pm *ProgressManager) getPacketInfo() string {
-	packetCount := GetGlobalState().GetPacketCount()
+	if pm.state == nil {
+		return ""
+	}
+	packetCount := pm.state.GetPacketCount()
 	if packetCount == 0 {
 		return ""
 	}
 
-	tcpSuccess := GetGlobalState().GetTCPSuccessPacketCount()
-	tcpFailed := GetGlobalState().GetTCPFailedPacketCount()
+	tcpSuccess := pm.state.GetTCPSuccessPacketCount()
+	tcpFailed := pm.state.GetTCPFailedPacketCount()
 
 	// 简化格式：TCP:成功/失败
 	if tcpSuccess > 0 || tcpFailed > 0 {
@@ -301,7 +319,7 @@ func (pm *ProgressManager) showCompletionInfo() {
 	fmt.Print("\n")
 
 	completionMsg := i18n.GetText("progress_scan_completed")
-	if GetFlagVars().NoColor {
+	if pm.noColor {
 		fmt.Printf("[完成] %s %d/%d (耗时: %s)\n",
 			completionMsg, pm.total, pm.total, formatDuration(elapsed))
 	} else {
@@ -461,7 +479,7 @@ func (pm *ProgressManager) GetPercent() float64 {
 	if !pm.isActive || pm.total == 0 {
 		return 0
 	}
-	return float64(pm.current) / float64(pm.total) * 100
+	return float64(atomic.LoadInt64(&pm.current)) / float64(pm.total) * 100
 }
 
 // =============================================================================
@@ -470,6 +488,10 @@ func (pm *ProgressManager) GetPercent() float64 {
 
 // LogWithProgress 在进度条活跃时协调日志输出
 func LogWithProgress(message string) {
+	if cfg := GetGlobalConfig(); cfg != nil && cfg.Output.Silent {
+		return
+	}
+
 	pm := GetProgressManager()
 	if !pm.IsActive() {
 		// 如果进度条不活跃，直接输出
@@ -499,7 +521,7 @@ func (pm *ProgressManager) renderProgressUnsafe() {
 	// 计算当前百分比（避免除零）
 	currentPercent := 0
 	if pm.total > 0 {
-		currentPercent = int((pm.current * 100) / pm.total)
+		currentPercent = int((atomic.LoadInt64(&pm.current) * 100) / pm.total)
 	}
 
 	// 只在百分比变化时更新，减少不必要的渲染
@@ -532,7 +554,7 @@ func (pm *ProgressManager) renderProgressUnsafe() {
 	fmt.Print(clearStr)
 
 	// 输出进度条（带颜色，如果启用）
-	if GetFlagVars().NoColor {
+	if pm.noColor {
 		fmt.Print(progressBar)
 	} else {
 		fmt.Printf("%s%s%s", AnsiCyan, progressBar, AnsiReset)

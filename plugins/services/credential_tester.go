@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -77,12 +78,18 @@ func TestSingleCredential(ctx context.Context, cred Credential, authFn AuthFunc)
 	case result := <-resultChan:
 		return result
 	case <-ctx.Done():
-		// context 被取消，但 goroutine 可能还在运行
-		// 启动清理协程：等待结果并关闭连接
+		// context 被取消，但 authFn goroutine 可能还阻塞在第三方库 IO 上
+		// 限时等待：超过 5 秒直接放弃，避免 goroutine 无限泄漏
 		go func() {
-			result := <-resultChan
-			if result != nil && result.Conn != nil {
-				_ = result.Conn.Close()
+			timer := time.NewTimer(5 * time.Second)
+			defer timer.Stop()
+			select {
+			case result := <-resultChan:
+				if result != nil && result.Conn != nil {
+					_ = result.Conn.Close()
+				}
+			case <-timer.C:
+				// 第三方库不响应取消，放弃等待
 			}
 		}()
 		return &AuthResult{
@@ -103,6 +110,7 @@ type ConcurrentTestConfig struct {
 	MaxRetries             int           // 最大重试次数，默认 3
 	RetryDelay             time.Duration // 重试延迟，默认 1s
 	MaxConsecutiveNetErrors int          // 连续网络错误阈值，超过则认为目标不可达，默认 5
+	TargetAddr             string        // 目标地址 host:port，用于 TCP 预检（可选）
 }
 
 // DefaultConcurrentTestConfig 默认配置
@@ -112,10 +120,18 @@ func DefaultConcurrentTestConfig(config *common.Config) ConcurrentTestConfig {
 		concurrency = 10
 	}
 	return ConcurrentTestConfig{
-		Concurrency: concurrency,
-		MaxRetries:  3,
-		RetryDelay:  time.Second,
+		Concurrency:             concurrency,
+		MaxRetries:              3,
+		RetryDelay:              time.Second,
+		MaxConsecutiveNetErrors: 5,
 	}
+}
+
+// DefaultConcurrentTestConfigWithTarget 带目标预检的默认配置
+func DefaultConcurrentTestConfigWithTarget(config *common.Config, info *common.HostInfo) ConcurrentTestConfig {
+	cfg := DefaultConcurrentTestConfig(config)
+	cfg.TargetAddr = fmt.Sprintf("%s:%d", info.Host, info.Port)
+	return cfg
 }
 
 // TestCredentialsConcurrently 并发测试多个凭据
@@ -135,6 +151,20 @@ func TestCredentialsConcurrently(
 		}
 	}
 
+	// TCP 预检：快速验证目标可达，避免对不可达目标浪费全部凭据尝试
+	// 代理模式下跳过：net.DialTimeout 直连无法到达代理后的内网目标
+	if testConfig.TargetAddr != "" && !common.IsProxyEnabled() {
+		preConn, err := net.DialTimeout("tcp", testConfig.TargetAddr, 3*time.Second)
+		if err != nil {
+			return &ScanResult{
+				Success: false,
+				Service: serviceName,
+				Error:   fmt.Errorf("目标不可达: %w", err),
+			}
+		}
+		_ = preConn.Close()
+	}
+
 	// 调整并发数
 	concurrency := testConfig.Concurrency
 	if concurrency > len(credentials) {
@@ -145,9 +175,9 @@ func TestCredentialsConcurrently(
 	cancelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// 通道
+	// 通道（buffer 设为 concurrency+1 避免 worker 阻塞在发送上）
 	credChan := make(chan Credential, len(credentials))
-	resultChan := make(chan *ScanResult, concurrency)
+	resultChan := make(chan *ScanResult, concurrency+1)
 
 	// 发送所有凭据
 	for _, cred := range credentials {
@@ -205,6 +235,12 @@ func workerTestCredentials(
 	serviceName string,
 	testConfig ConcurrentTestConfig,
 ) {
+	consecutiveNetErrors := 0
+	maxNetErrors := testConfig.MaxConsecutiveNetErrors
+	if maxNetErrors <= 0 {
+		maxNetErrors = 5
+	}
+
 	for cred := range credChan {
 		// 检查是否应该停止
 		select {
@@ -213,11 +249,23 @@ func workerTestCredentials(
 		default:
 		}
 
+		// 连续网络错误达到阈值，目标可能不可达，提前退出
+		if consecutiveNetErrors >= maxNetErrors {
+			return
+		}
+
 		// 带重试的凭据测试
 		result := testCredentialWithRetry(ctx, cred, authFn, serviceName, testConfig)
 		if result != nil && result.Success {
 			resultChan <- result
 			return
+		}
+
+		// 跟踪连续网络错误
+		if result != nil && result.Error != nil {
+			consecutiveNetErrors++
+		} else {
+			consecutiveNetErrors = 0
 		}
 	}
 }
@@ -261,11 +309,12 @@ func testCredentialWithRetry(
 		case ErrorTypeNetwork, ErrorTypeUnknown:
 			// 网络错误或未知错误，可以重试（可能是服务端限流等临时问题）
 			if attempt < testConfig.MaxRetries-1 {
+				timer := time.NewTimer(testConfig.RetryDelay)
 				select {
 				case <-ctx.Done():
+					timer.Stop()
 					return nil
-				case <-time.After(testConfig.RetryDelay):
-					// 继续重试
+				case <-timer.C:
 				}
 			}
 		}

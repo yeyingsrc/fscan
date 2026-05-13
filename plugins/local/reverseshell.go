@@ -5,6 +5,7 @@ package local
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/shadow1ng/fscan/common"
 	"github.com/shadow1ng/fscan/common/i18n"
@@ -38,7 +40,9 @@ func NewReverseShellPlugin() *ReverseShellPlugin {
 // GetName 实现Plugin接口
 
 // Scan 执行反弹Shell - 直接实现
-func (p *ReverseShellPlugin) Scan(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *plugins.Result {
+func (p *ReverseShellPlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *plugins.Result {
+	config := session.Config
+	state := session.State
 	var output strings.Builder
 
 	// 从config获取配置
@@ -123,11 +127,19 @@ func (p *ReverseShellPlugin) startNativeReverseShell(ctx context.Context, host s
 		prompt := fmt.Sprintf("%s> ", getCurrentDir())
 		_, _ = conn.Write([]byte(prompt))
 
+		// 设置读取超时，以便能响应 ctx 取消
+		_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+
 		// 读取命令
 		cmdLine, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
 				return nil
+			}
+			// 超时继续循环检查 ctx
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				continue
 			}
 			return fmt.Errorf("读取命令错误: %w", err)
 		}

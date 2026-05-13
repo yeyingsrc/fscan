@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -38,27 +39,32 @@ var resourceExhaustedPatterns = []string{
 }
 
 // resultCollector 结果收集器，用于并发安全地收集扫描结果
-// 使用 map 实现：O(1) 的添加和删除，无顺序依赖问题
 type resultCollector struct {
-	mu    sync.Mutex
-	addrs map[string]struct{}
+	mu     sync.Mutex
+	addrs  map[string]struct{}
+	stream chan<- string
 }
 
-// newResultCollector 创建结果收集器
-func newResultCollector() *resultCollector {
+func newResultCollector(stream chan<- string) *resultCollector {
 	return &resultCollector{
-		addrs: make(map[string]struct{}),
+		addrs:  make(map[string]struct{}),
+		stream: stream,
 	}
 }
 
-// Add 添加一个扫描结果
 func (c *resultCollector) Add(addr string) {
 	c.mu.Lock()
+	if _, dup := c.addrs[addr]; dup {
+		c.mu.Unlock()
+		return
+	}
 	c.addrs[addr] = struct{}{}
 	c.mu.Unlock()
+	if c.stream != nil {
+		c.stream <- addr
+	}
 }
 
-// GetAll 获取所有结果
 func (c *resultCollector) GetAll() []string {
 	c.mu.Lock()
 	result := make([]string, 0, len(c.addrs))
@@ -110,13 +116,31 @@ func (f *failedPortCollector) Count() int {
 
 // EnhancedPortScan 高性能端口扫描函数
 // 使用滑动窗口调度 + 自适应线程池 + 流式迭代器
-func EnhancedPortScan(hosts []string, ports string, timeout int64, config *common.Config, state *common.State) []string {
+// stream: 可选，非 nil 时每发现开放端口立即发送 addr，扫描结束后关闭
+func EnhancedPortScan(ctx context.Context, hosts []string, ports string, timeout int64, session *common.ScanSession, stream chan<- string) []string {
+	config := session.Config
+	state := session.State
 	common.LogDebug(fmt.Sprintf("[PortScan] 开始: %d个主机, 线程数=%d", len(hosts), config.ThreadNum))
+
+	// 大规模扫描预筛：跨多个 /24 时先做网段探活，跳过空网段
+	if len(hosts) > subnetProbeThreshold {
+		hosts = probeSubnets(ctx, hosts, time.Duration(timeout)*time.Second, session)
+		if len(hosts) == 0 {
+			common.LogInfo(i18n.GetText("port_scan_no_alive_subnet"))
+			if stream != nil {
+				close(stream)
+			}
+			return nil
+		}
+	}
 
 	// 解析端口和排除端口
 	portList := parsers.ParsePort(ports)
 	if len(portList) == 0 {
 		common.LogError(i18n.Tr("invalid_port", ports))
+		if stream != nil {
+			close(stream)
+		}
 		return nil
 	}
 	common.LogDebug(fmt.Sprintf("[PortScan] 端口解析完成: %d个端口", len(portList)))
@@ -161,8 +185,9 @@ func EnhancedPortScan(hosts []string, ports string, timeout int64, config *commo
 
 	// 初始化并发控制
 	to := time.Duration(timeout) * time.Second
+	adaptiveTO := NewAdaptiveTimeout(to)
 	var count int64
-	collector := newResultCollector()
+	collector := newResultCollector(stream)
 	failedCollector := &failedPortCollector{}
 	var wg sync.WaitGroup
 
@@ -179,11 +204,14 @@ func EnhancedPortScan(hosts []string, ports string, timeout int64, config *commo
 		}()
 
 		addr := fmt.Sprintf("%s:%d", taskInfo.host, taskInfo.port)
-		scanSinglePort(taskInfo.host, taskInfo.port, addr, to, &count, collector, failedCollector, config, state)
+		scanSinglePort(ctx, taskInfo.host, taskInfo.port, addr, adaptiveTO, &count, collector, failedCollector, session)
 		common.UpdateProgressBar(1)
 	}, state)
 	if err != nil {
 		common.LogError(i18n.Tr("thread_pool_create_failed", err))
+		if stream != nil {
+			close(stream)
+		}
 		return nil
 	}
 	common.LogDebug("[PortScan] 线程池创建成功")
@@ -196,6 +224,11 @@ func EnhancedPortScan(hosts []string, ports string, timeout int64, config *commo
 
 	// 收集结果
 	aliveAddrs := collector.GetAll()
+
+	// 关闭流式通知 channel
+	if stream != nil {
+		close(stream)
+	}
 
 	// 完成端口扫描进度条
 	if common.IsProgressActive() {
@@ -252,7 +285,10 @@ func slidingWindowSchedule(iter *SocketIterator, pool *AdaptivePool, wg *sync.Wa
 			port:      port,
 			semaphore: semaphore,
 		}
-		_ = pool.Invoke(task)
+		if err := pool.Invoke(task); err != nil {
+			<-semaphore
+			wg.Done()
+		}
 	}
 
 	// 等待所有任务完成
@@ -260,11 +296,11 @@ func slidingWindowSchedule(iter *SocketIterator, pool *AdaptivePool, wg *sync.Wa
 }
 
 // connectWithRetry 带重试的TCP连接 - 只对资源耗尽错误重试
-func connectWithRetry(addr string, timeout time.Duration, maxRetries int, state *common.State) (net.Conn, error) {
+func connectWithRetry(ctx context.Context, session *common.ScanSession, addr string, timeout time.Duration, maxRetries int) (net.Conn, error) {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		conn, err := common.WrapperTcpWithTimeout("tcp", addr, timeout)
+		conn, err := session.DialTCP(ctx, "tcp", addr, timeout)
 
 		if err == nil {
 			return conn, nil
@@ -278,11 +314,11 @@ func connectWithRetry(addr string, timeout time.Duration, maxRetries int, state 
 		}
 
 		// 记录资源耗尽错误
-		state.IncrementResourceExhaustedCount()
+		session.State.IncrementResourceExhaustedCount()
 
-		// 指数退避：第1次等50ms，第2次等150ms
+		// 指数退避：200ms → 600ms → 1200ms
 		if attempt < maxRetries-1 {
-			waitTime := time.Duration(50*(attempt+1)) * time.Millisecond
+			waitTime := time.Duration(200*(1<<uint(attempt))) * time.Millisecond
 			time.Sleep(waitTime)
 		}
 	}
@@ -341,13 +377,17 @@ func buildServiceLogMessage(addr string, serviceInfo *ServiceInfo, isWeb bool) s
 }
 
 // scanSinglePort 扫描单个端口并进行服务识别（重构后的简洁版本）
-func scanSinglePort(host string, port int, addr string, timeout time.Duration, count *int64, collector *resultCollector, failedCollector *failedPortCollector, config *common.Config, state *common.State) {
+func scanSinglePort(ctx context.Context, host string, port int, addr string, adaptiveTO *AdaptiveTimeout, count *int64, collector *resultCollector, failedCollector *failedPortCollector, session *common.ScanSession) {
+	config := session.Config
+	timeout := adaptiveTO.Timeout()
 	// 步骤1：建立连接
-	conn, err := connectWithRetry(addr, timeout, 3, state)
+	start := time.Now()
+	conn, err := connectWithRetry(ctx, session, addr, timeout, 2)
 	if err != nil {
 		handleConnectionFailure(err, host, port, addr, failedCollector)
 		return
 	}
+	adaptiveTO.Record(time.Since(start))
 
 	// 步骤1.5：代理连接深度验证（防止透明代理/全回显代理的假连接问题）
 	valid, verifyMethod := verifyProxyConnectionDeep(conn, addr)
@@ -362,7 +402,7 @@ func scanSinglePort(host string, port int, addr string, timeout time.Duration, c
 	if common.IsProxyEnabled() && verifyMethod != "direct" {
 		_ = conn.Close()
 		// 重新建立干净的连接用于服务识别
-		conn, err = connectWithRetry(addr, timeout, 3, state)
+		conn, err = connectWithRetry(ctx, session, addr, timeout, 2)
 		if err != nil {
 			handleConnectionFailure(err, host, port, addr, failedCollector)
 			return
@@ -375,24 +415,29 @@ func scanSinglePort(host string, port int, addr string, timeout time.Duration, c
 	saveOpenPort(host, port)
 
 	// 步骤3：服务识别（Scanner负责关闭连接，包括探测中可能创建的新连接）
-	scanner := NewSmartPortInfoScanner(host, port, conn, timeout, config)
+	scanner := NewSmartPortInfoScanner(ctx, host, port, conn, timeout, config, session)
+	// 服务探测超时自适应：用 RTT 采样值约束读超时上限
+	// 下限 500ms：服务处理需要时间，不能太激进
+	if rttTO := adaptiveTO.Timeout(); rttTO < timeout {
+		maxMS := int(rttTO.Milliseconds()) * 6
+		if maxMS < 500 {
+			maxMS = 500
+		}
+		scanner.info.maxReadTimeoutMS = maxMS
+	}
 	defer scanner.Close()
 	serviceInfo, _ := scanner.SmartIdentify()
 
 	// 步骤4：处理结果
-	processServiceResult(host, port, addr, serviceInfo, config)
+	processServiceResult(host, port, addr, serviceInfo, config, session)
 }
 
 // handleConnectionFailure 处理连接失败
+// 只收集资源耗尽类错误，timeout 是正常的扫描结果（防火墙 drop）不计入失败
 func handleConnectionFailure(err error, host string, port int, addr string, failedCollector *failedPortCollector) {
-	if isResourceExhaustedError(err) || isTimeoutError(err) {
+	if isResourceExhaustedError(err) {
 		failedCollector.Add(host, port, addr)
 	}
-}
-
-// isTimeoutError 判断是否为超时错误
-func isTimeoutError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "i/o timeout")
 }
 
 // verifyProxyConnectionDeep 深度验证代理连接是否真正可用
@@ -404,8 +449,9 @@ func isTimeoutError(err error) bool {
 // 2. 轻量探测 (发送 \r\n) - 触发某些服务响应，同时不污染协议状态
 // 3. 短超时等待 (500ms) - 平衡准确性和性能
 func verifyProxyConnectionDeep(conn net.Conn, addr string) (bool, string) {
-	// 如果没有使用代理，跳过验证
-	if !common.IsProxyEnabled() {
+	// 无代理或SOCKS5代理：跳过深度验证
+	// SOCKS5协议层已验证连接可达性，连接成功即端口开放
+	if !common.IsProxyEnabled() || common.IsSOCKS5Proxy() {
 		return true, "direct"
 	}
 
@@ -550,10 +596,10 @@ func saveOpenPort(host string, port int) {
 }
 
 // processServiceResult 处理服务识别结果
-func processServiceResult(host string, port int, addr string, serviceInfo *ServiceInfo, config *common.Config) {
+func processServiceResult(host string, port int, addr string, serviceInfo *ServiceInfo, config *common.Config, session *common.ScanSession) {
 	if serviceInfo == nil {
 		// 服务识别失败，尝试 HTTP 回退探测
-		if !tryHTTPFallbackDetection(host, port, addr, config) {
+		if !tryHTTPFallbackDetection(host, port, addr, config, session) {
 			common.LogInfo(i18n.Tr("port_open", addr))
 		}
 		return
@@ -613,10 +659,10 @@ func buildServiceDetails(port int, info *ServiceInfo) map[string]interface{} {
 }
 
 // tryHTTPFallbackDetection 尝试HTTP回退探测，返回是否成功识别为HTTP服务
-func tryHTTPFallbackDetection(host string, port int, addr string, config *common.Config) bool {
+func tryHTTPFallbackDetection(host string, port int, addr string, config *common.Config, session *common.ScanSession) bool {
 	// 使用WebDetection进行HTTP协议探测
 	webDetector := GetWebPortDetector()
-	if !webDetector.DetectHTTPServiceOnly(host, port, config) {
+	if !webDetector.DetectHTTPServiceOnly(host, port, config, session) {
 		return false
 	}
 
@@ -646,4 +692,141 @@ func tryHTTPFallbackDetection(host string, port int, addr string, config *common
 
 	common.LogInfo(i18n.Tr("port_open_http", addr))
 	return true
+}
+
+// =============================================================================
+// 网段预筛 — 大规模扫描时跳过空 /24 网段
+// =============================================================================
+
+// subnetProbeThreshold 触发网段预筛的主机数阈值（超过 1 个 /24）
+const subnetProbeThreshold = 256
+
+// subnetProbePorts 逐主机探活用的端口（轮换）
+var subnetProbePorts = []int{80, 443, 22, 445, 3389, 8080, 3306, 6379}
+
+// gatewayProbePorts 网关启发式探测端口（网关常开的服务）
+var gatewayProbePorts = []int{22, 80, 443, 23, 8080, 161, 53, 3389}
+
+// gatewayOffsets 网关候选地址偏移量
+var gatewayOffsets = []string{".1", ".254"}
+
+// subnetProbeTimeout 每个探测的超时
+const subnetProbeTimeout = 1500 * time.Millisecond
+
+// subnetProbeConcurrency 网段探活全局并发数
+const subnetProbeConcurrency = 500
+
+// probeSubnets 对每个 /24 网段做探活，返回属于存活网段的主机列表
+// 两阶段策略：
+//
+//	阶段 1（快速）：对每个子网的 .1/.254 网关做多端口探测，命中即标记存活
+//	阶段 2（兜底）：未命中的子网，逐主机单端口轮换扫描
+func probeSubnets(ctx context.Context, hosts []string, timeout time.Duration, session *common.ScanSession) []string {
+	// 按 /24 分组
+	subnets := make(map[string][]string)
+	for _, h := range hosts {
+		prefix := subnetPrefix(h)
+		if prefix != "" {
+			subnets[prefix] = append(subnets[prefix], h)
+		}
+	}
+
+	if len(subnets) <= 1 {
+		return hosts
+	}
+
+	common.LogInfo(fmt.Sprintf("网段预筛: %d 个 /24 子网, %d 个主机", len(subnets), len(hosts)))
+
+	aliveSubnets := sync.Map{}
+	var wg sync.WaitGroup
+	limiter := make(chan struct{}, subnetProbeConcurrency)
+
+	// ── 阶段 1：网关启发式 ──────────────────────────────────
+	// 对每个子网的 .1 和 .254 打多个端口，命中率高且速度极快
+	for prefix := range subnets {
+		for _, suffix := range gatewayOffsets {
+			gw := prefix + suffix
+			for _, port := range gatewayProbePorts {
+				wg.Add(1)
+				limiter <- struct{}{}
+				go func(pfx, addr string) {
+					defer func() { <-limiter; wg.Done() }()
+					conn, err := net.DialTimeout("tcp", addr, subnetProbeTimeout)
+					if err == nil {
+						_ = conn.Close()
+						aliveSubnets.Store(pfx, true)
+					}
+				}(prefix, fmt.Sprintf("%s:%d", gw, port))
+			}
+		}
+	}
+	wg.Wait()
+
+	// 统计阶段 1 命中
+	gwHits := 0
+	aliveSubnets.Range(func(_, _ interface{}) bool { gwHits++; return true })
+
+	// ── 阶段 2：逐主机兜底（仅对网关未命中的子网）──────────
+	for prefix, subnetHosts := range subnets {
+		if _, alive := aliveSubnets.Load(prefix); alive {
+			continue // 网关已命中，跳过
+		}
+
+		for i, host := range subnetHosts {
+			select {
+			case <-ctx.Done():
+				goto done
+			default:
+			}
+
+			if _, alive := aliveSubnets.Load(prefix); alive {
+				break
+			}
+
+			port := subnetProbePorts[i%len(subnetProbePorts)]
+			wg.Add(1)
+			limiter <- struct{}{}
+
+			go func(pfx, h string, p int) {
+				defer func() { <-limiter; wg.Done() }()
+				conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", h, p), subnetProbeTimeout)
+				if err == nil {
+					_ = conn.Close()
+					aliveSubnets.Store(pfx, true)
+				}
+			}(prefix, host, port)
+		}
+	}
+
+done:
+	wg.Wait()
+
+	// 统计
+	aliveCount := 0
+	aliveSubnets.Range(func(_, _ interface{}) bool { aliveCount++; return true })
+
+	if aliveCount == 0 {
+		return nil
+	}
+
+	result := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		if _, alive := aliveSubnets.Load(subnetPrefix(h)); alive {
+			result = append(result, h)
+		}
+	}
+
+	skipped := len(subnets) - aliveCount
+	common.LogInfo(fmt.Sprintf("网段预筛完成: %d 个存活 (网关命中 %d), %d 个跳过, 剩余 %d 主机",
+		aliveCount, gwHits, skipped, len(result)))
+	return result
+}
+
+// subnetPrefix 提取 IP 的 /24 前缀（如 "10.1.1"）
+func subnetPrefix(ip string) string {
+	lastDot := strings.LastIndex(ip, ".")
+	if lastDot <= 0 {
+		return ""
+	}
+	return ip[:lastDot]
 }

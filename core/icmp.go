@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -39,7 +40,9 @@ var pingErrorKeywords = []string{
 
 // CheckLive 检测主机存活状态
 // 支持 ICMP/Ping 探测，并在响应率过低时自动启用 TCP 补充探测
-func CheckLive(hostslist []string, Ping bool, config *common.Config, state *common.State) []string {
+func CheckLive(ctx context.Context, hostslist []string, Ping bool, session *common.ScanSession) []string {
+	config := session.Config
+	state := session.State
 	// 创建局部WaitGroup
 	var livewg sync.WaitGroup
 
@@ -68,7 +71,7 @@ func CheckLive(hostslist []string, Ping bool, config *common.Config, state *comm
 
 	// TCP 补充探测：当 ICMP/Ping 响应率过低时自动启用
 	// 这对防火墙过滤 ICMP 的环境特别有用
-	aliveHosts = tcpSupplementaryProbe(hostslist, aliveHosts, config)
+	aliveHosts = tcpSupplementaryProbe(ctx, hostslist, aliveHosts, session)
 
 	// 输出存活统计信息
 	printAliveStats(aliveHosts, hostslist)
@@ -78,7 +81,11 @@ func CheckLive(hostslist []string, Ping bool, config *common.Config, state *comm
 
 // tcpSupplementaryProbe TCP 补充探测
 // 当 ICMP 响应率过低时（<10%），对未响应主机进行 TCP 探测
-func tcpSupplementaryProbe(allHosts []string, aliveHosts []string, config *common.Config) []string {
+func tcpSupplementaryProbe(ctx context.Context, allHosts []string, aliveHosts []string, session *common.ScanSession) []string {
+	if session.Config.DisableTcpProbe || session.Config.Mode == "icmp" {
+		return aliveHosts
+	}
+
 	totalHosts := len(allHosts)
 	if totalHosts == 0 {
 		return aliveHosts
@@ -102,7 +109,7 @@ func tcpSupplementaryProbe(allHosts []string, aliveHosts []string, config *commo
 	common.LogInfo(i18n.Tr("tcp_probe_low_icmp_rate", fmt.Sprintf("%.1f%%", responseRate*100), len(unrespondedHosts)))
 
 	// 执行 TCP 补充探测
-	tcpAliveHosts := runTcpProbeForHosts(unrespondedHosts, config)
+	tcpAliveHosts := runTcpProbeForHosts(ctx, unrespondedHosts, session)
 
 	// 合并结果
 	if len(tcpAliveHosts) > 0 {
@@ -321,8 +328,8 @@ func RunIcmp1(hostslist []string, conn *icmp.PacketConn, chanHosts chan string, 
 	var endflag atomic.Bool
 	var listenerWg sync.WaitGroup
 
-	// 创建布隆过滤器用于去重（自动根据主机数量调整大小）
-	bloomFilter := NewBloomFilter(len(hostslist), 0.01)
+	// 去重集合：过滤重复的ICMP响应
+	seen := make(map[string]struct{}, len(hostslist))
 
 	// 启动监听协程
 	listenerWg.Add(1)
@@ -358,11 +365,10 @@ func RunIcmp1(hostslist []string, conn *icmp.PacketConn, chanHosts chan string, 
 			if sourceIP != nil && !endflag.Load() {
 				ipStr := sourceIP.String()
 
-				// 使用布隆过滤器去重，过滤重复的ICMP响应和杂包
-				if bloomFilter.Contains(ipStr) {
+				if _, dup := seen[ipStr]; dup {
 					continue
 				}
-				bloomFilter.Add(ipStr)
+				seen[ipStr] = struct{}{}
 
 				livewg.Add(1)
 				select {
@@ -376,13 +382,22 @@ func RunIcmp1(hostslist []string, conn *icmp.PacketConn, chanHosts chan string, 
 		}
 	}()
 
-	// 发送ICMP请求（应用令牌桶限速）
-	limiter := state.GetICMPLimiter(config.Network.ICMPRate)
+	// 发送ICMP请求（批量预构建 + 令牌桶限速）
+	// 预构建所有 ICMP 包和目标地址，减少发送循环中的开销
+	type icmpPacket struct {
+		data []byte
+		dst  net.Addr
+	}
+	packets := make([]icmpPacket, 0, len(hostslist))
 	for _, host := range hostslist {
-		limiter.Wait(1) // 等待令牌，控制发包速率
-		dst, _ := net.ResolveIPAddr("ip", host)
-		IcmpByte := makemsg(host)
-		_, _ = conn.WriteTo(IcmpByte, dst)
+		dst, _ := common.DNSCache.ResolveIP(host)
+		packets = append(packets, icmpPacket{data: makemsg(host), dst: dst})
+	}
+
+	limiter := state.GetICMPLimiter(config.Network.ICMPRate)
+	for i := range packets {
+		limiter.Wait(1)
+		_, _ = conn.WriteTo(packets[i].data, packets[i].dst)
 	}
 
 	// 自适应等待响应
@@ -470,8 +485,12 @@ func icmpalive(host string) bool {
 // RunPing 使用系统Ping命令并发探测主机存活
 func RunPing(hostslist []string, chanHosts chan string, livewg *sync.WaitGroup) {
 	var wg sync.WaitGroup
-	// 限制并发数为50
-	limiter := make(chan struct{}, 50)
+	// 并发数根据主机数动态调整，上限 200
+	concurrency := len(hostslist)
+	if concurrency > 200 {
+		concurrency = 200
+	}
+	limiter := make(chan struct{}, concurrency)
 
 	// 并发探测
 	for _, host := range hostslist {
@@ -674,20 +693,34 @@ func ArrayCountValueTop(arrInit []string, length int, flag bool) (arrTop []strin
 var tcpProbeCommonPorts = []int{80, 443, 22, 445}
 
 // tcpProbeTimeout TCP 探测超时时间（较短，只做存活判断）
-const tcpProbeTimeout = 2 * time.Second
+const tcpProbeTimeout = 1 * time.Second
 
 // tcpProbeThreshold TCP 补充探测触发阈值
 // 当 ICMP 响应率低于此值时，自动启用 TCP 补充探测
 const tcpProbeThreshold = 0.1 // 10%
 
-// tcpProbeAlive 使用 TCP 探测主机是否存活
-// 尝试连接常用端口，任一端口响应即认为存活
-func tcpProbeAlive(host string) bool {
+// tcpProbeAlive 使用 TCP 并行探测主机是否存活
+// 同时连接所有常用端口，任一响应即返回
+func tcpProbeAlive(ctx context.Context, session *common.ScanSession, host string) bool {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	result := make(chan bool, len(tcpProbeCommonPorts))
 	for _, port := range tcpProbeCommonPorts {
-		addr := fmt.Sprintf("%s:%d", host, port)
-		conn, err := common.WrapperTcpWithTimeout("tcp", addr, tcpProbeTimeout)
-		if err == nil {
-			_ = conn.Close()
+		go func(p int) {
+			addr := fmt.Sprintf("%s:%d", host, p)
+			conn, err := session.DialTCP(ctx, "tcp", addr, tcpProbeTimeout)
+			if err == nil {
+				_ = conn.Close()
+				result <- true
+				return
+			}
+			result <- false
+		}(port)
+	}
+
+	for range tcpProbeCommonPorts {
+		if <-result {
 			return true
 		}
 	}
@@ -696,7 +729,8 @@ func tcpProbeAlive(host string) bool {
 
 // runTcpProbeForHosts 对指定主机列表进行 TCP 补充探测
 // 返回存活的主机列表
-func runTcpProbeForHosts(hosts []string, config *common.Config) []string {
+func runTcpProbeForHosts(ctx context.Context, hosts []string, session *common.ScanSession) []string {
+	config := session.Config
 	if len(hosts) == 0 {
 		return nil
 	}
@@ -705,10 +739,10 @@ func runTcpProbeForHosts(hosts []string, config *common.Config) []string {
 	var mu sync.Mutex
 	aliveHosts := make([]string, 0)
 
-	// 并发控制，避免资源耗尽
-	concurrency := 50
-	if len(hosts) < concurrency {
-		concurrency = len(hosts)
+	// 并发控制，根据主机数动态调整，上限 200
+	concurrency := len(hosts)
+	if concurrency > 200 {
+		concurrency = 200
 	}
 	limiter := make(chan struct{}, concurrency)
 
@@ -722,7 +756,7 @@ func runTcpProbeForHosts(hosts []string, config *common.Config) []string {
 				wg.Done()
 			}()
 
-			if tcpProbeAlive(h) {
+			if tcpProbeAlive(ctx, session, h) {
 				mu.Lock()
 				aliveHosts = append(aliveHosts, h)
 				mu.Unlock()

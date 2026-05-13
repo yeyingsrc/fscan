@@ -1139,7 +1139,7 @@ func TestCSVWriter_ErrorHandling(t *testing.T) {
 // TestCSVWriter_DetailsFormatting 测试CSV的Details字段格式化
 //
 // CSVWriter 对不同类型有不同的格式：
-// - Service类型：Target, Service, Version, Banner
+// - Service类型：Target, Service, Version, Title, Status, Server, Fingerprints, Banner
 func TestCSVWriter_DetailsFormatting(t *testing.T) {
 	dir := createTestDir(t)
 	filePath := filepath.Join(dir, "test.csv")
@@ -1186,6 +1186,86 @@ func TestCSVWriter_DetailsFormatting(t *testing.T) {
 	}
 
 	t.Logf("✓ CSV Details格式化测试通过")
+}
+
+func TestCSVWriter_WebServiceFields(t *testing.T) {
+	dir := createTestDir(t)
+	filePath := filepath.Join(dir, "test.csv")
+
+	writer, _ := NewCSVWriter(filePath)
+	defer func() { _ = writer.Close() }()
+
+	_ = writer.WriteHeader()
+	result := createTestResult(
+		TypeService,
+		"192.168.1.1:80",
+		"web",
+		map[string]interface{}{
+			"plugin":       "webtitle",
+			"is_web":       true,
+			"port":         80,
+			"title":        "Home",
+			"status":       200,
+			"server":       "nginx",
+			"fingerprints": []string{"nginx", "php"},
+			"banner":       "HTTP/1.1 200 OK\x00\nServer: nginx",
+		},
+	)
+	_ = writer.Write(result)
+	writer.Close()
+
+	content := readFileContent(t, filePath)
+	for _, want := range []string{
+		"Target,Service,Version,Title,Status,Server,Fingerprints,Banner",
+		"webtitle",
+		"Home",
+		"200",
+		"nginx",
+		"nginx,php",
+		"\\x00\\nServer: nginx",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("CSV文件缺少 %q，内容:\n%s", want, content)
+		}
+	}
+}
+
+func TestTXTWriter_WebServiceProtocolFromDetails(t *testing.T) {
+	dir := createTestDir(t)
+	filePath := filepath.Join(dir, "test_web_protocol.txt")
+
+	writer, err := NewTXTWriter(filePath)
+	if err != nil {
+		t.Fatalf("创建TXTWriter失败: %v", err)
+	}
+
+	result := createTestResult(
+		TypeService,
+		"192.168.1.1:8443",
+		"web",
+		map[string]interface{}{
+			"plugin":   "webtitle",
+			"is_web":   true,
+			"port":     8443,
+			"protocol": "https",
+			"title":    "Home",
+			"status":   200,
+		},
+	)
+	if err := writer.Write(result); err != nil {
+		t.Fatalf("Write()失败: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close()失败: %v", err)
+	}
+
+	content := readFileContent(t, filePath)
+	if !strings.Contains(content, "https://192.168.1.1:8443") {
+		t.Fatalf("TXT输出缺少HTTPS URL，内容:\n%s", content)
+	}
+	if strings.Contains(content, "http://192.168.1.1:8443") {
+		t.Fatalf("TXT输出不应把HTTPS目标降级为HTTP，内容:\n%s", content)
+	}
 }
 
 // TestJSONWriter_FlushAndFormat 测试JSON的Flush和GetFormat

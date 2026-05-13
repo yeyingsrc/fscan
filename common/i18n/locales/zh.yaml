@@ -28,6 +28,10 @@ flag_global_timeout:
   other: "全局超时时间"
 flag_disable_ping:
   other: "禁用ping探测"
+flag_disable_tcp_probe:
+  other: "禁用TCP补充探测"
+flag_debug:
+  other: "开启调试模式，日志写入fscan_debug.log"
 flag_alive_only:
   other: "仅进行存活探测"
 flag_username:
@@ -341,6 +345,8 @@ port_open:
   other: "端口开放 {{.Arg1}}"
 port_open_http:
   other: "端口开放 {{.Arg1}} [http](HTTP探测)"
+port_scan_no_alive_subnet:
+  other: "网段预筛未发现存活子网，跳过端口扫描"
 
 # ========================= 本地扫描消息 =========================
 local_plugin_info:
@@ -426,6 +432,8 @@ telnet_unauth_rce:
   other: "Telnet {{.Arg1}} 未授权访问且可执行命令 [{{.Arg2}}] {{.Arg3}}"
 telnet_credential_rce:
   other: "Telnet {{.Arg1}} {{.Arg2}}:{{.Arg3}} 命令执行验证成功 [{{.Arg4}}] {{.Arg5}}"
+telnet_cve202624061:
+  other: "Telnet {{.Arg1}} CVE-2026-24061 Telnet认证绕过 (用户: {{.Arg2}}) {{.Arg3}}"
 cassandra_credential:
   other: "Cassandra {{.Arg1}} {{.Arg2}}:{{.Arg3}}"
 cassandra_service:

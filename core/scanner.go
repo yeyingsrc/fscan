@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -18,7 +19,7 @@ import (
 
 // ScanStrategy 定义扫描策略接口
 type ScanStrategy interface {
-	Execute(config *common.Config, state *common.State, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup)
+	Execute(ctx context.Context, session *common.ScanSession, info common.HostInfo, ch chan struct{}, wg *sync.WaitGroup)
 	GetPlugins(config *common.Config) ([]string, bool)
 	IsPluginApplicableByName(pluginName string, targetHost string, targetPort int, isCustomMode bool, config *common.Config) bool
 }
@@ -73,7 +74,13 @@ func selectStrategy(config *common.Config, state *common.State, info common.Host
 }
 
 // RunScan 执行整体扫描流程
-func RunScan(info common.HostInfo, config *common.Config, state *common.State) {
+func RunScan(ctx context.Context, info common.HostInfo, session *common.ScanSession) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	config := session.Config
+	state := session.State
+
 	// 初始化HTTP客户端（静默，无需日志）
 	if err := lib.Inithttp(config); err != nil {
 		common.LogError(i18n.Tr("http_client_init_failed", err))
@@ -88,7 +95,7 @@ func RunScan(info common.HostInfo, config *common.Config, state *common.State) {
 	wg := sync.WaitGroup{}
 
 	// 执行策略
-	strategy.Execute(config, state, info, ch, &wg)
+	strategy.Execute(ctx, session, info, ch, &wg)
 
 	// 等待所有扫描完成
 	wg.Wait()
@@ -106,11 +113,16 @@ func RunScan(info common.HostInfo, config *common.Config, state *common.State) {
 		}
 		common.LogInfo(i18n.GetText("press_ctrl_c_exit"))
 
-		// 优雅等待信号
+		// 优雅等待信号或 context 取消（Web Stop）
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-		<-sigChan
-		common.LogInfo(i18n.GetText("received_exit_signal"))
+		select {
+		case <-sigChan:
+			common.LogInfo(i18n.GetText("received_exit_signal"))
+		case <-ctx.Done():
+		}
+		cancel()
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	// 完成扫描
@@ -134,7 +146,9 @@ func finishScan(config *common.Config, state *common.State) {
 }
 
 // ExecuteScanTasks 任务执行通用框架
-func ExecuteScanTasks(config *common.Config, state *common.State, targets []common.HostInfo, strategy ScanStrategy, ch chan struct{}, wg *sync.WaitGroup) {
+func ExecuteScanTasks(ctx context.Context, session *common.ScanSession, targets []common.HostInfo, strategy ScanStrategy, ch chan struct{}, wg *sync.WaitGroup) {
+	config := session.Config
+
 	// 获取要执行的插件
 	pluginsToRun, isCustomMode := strategy.GetPlugins(config)
 
@@ -149,6 +163,13 @@ func ExecuteScanTasks(config *common.Config, state *common.State, targets []comm
 
 	// 流式执行任务，避免预构建大量任务对象
 	for _, target := range targets {
+		// 检查取消
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		targetPort := target.Port
 
 		for _, pluginName := range pluginsToRun {
@@ -159,7 +180,7 @@ func ExecuteScanTasks(config *common.Config, state *common.State, targets []comm
 
 			// 检查插件是否适用于当前目标
 			if strategy.IsPluginApplicableByName(pluginName, target.Host, targetPort, isCustomMode, config) {
-				executeScanTask(config, state, pluginName, target, ch, wg)
+				executeScanTask(ctx, session, pluginName, target, ch, wg)
 			}
 		}
 	}
@@ -182,10 +203,44 @@ func countApplicableTasks(targets []common.HostInfo, pluginsToRun []string, isCu
 	return count
 }
 
+// longRunningPlugins 长驻插件，不加入 scan WaitGroup，通过 ctx 取消退出
+var longRunningPlugins = map[string]bool{
+	"forwardshell": true,
+	"socks5proxy":  true,
+	"reverseshell": true,
+}
+
 // executeScanTask 执行单个扫描任务
-func executeScanTask(config *common.Config, state *common.State, pluginName string, target common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
+func executeScanTask(ctx context.Context, session *common.ScanSession, pluginName string, target common.HostInfo, ch chan struct{}, wg *sync.WaitGroup) {
+	state := session.State
+
+	// 检查取消
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	// 长驻插件不进 WaitGroup，通过 ctx 管理生命周期
+	if longRunningPlugins[pluginName] {
+		go func() {
+			plugin := plugins.Get(pluginName)
+			if plugin != nil {
+				plugin.Scan(ctx, &target, session)
+			}
+		}()
+		return
+	}
+
 	wg.Add(1)
-	ch <- struct{}{} // 获取并发槽位
+
+	// 获取并发槽位，支持取消
+	select {
+	case ch <- struct{}{}:
+	case <-ctx.Done():
+		wg.Done()
+		return
+	}
 
 	go func() {
 		// 开始监控插件任务
@@ -210,7 +265,7 @@ func executeScanTask(config *common.Config, state *common.State, pluginName stri
 
 		plugin := plugins.Get(pluginName)
 		if plugin != nil {
-			result := plugin.Scan(context.Background(), &target, config, state)
+			result := plugin.Scan(ctx, &target, session)
 			if result != nil {
 				if result.Success {
 					// 保存成功的扫描结果到文件
@@ -286,9 +341,16 @@ var resultSerializers = map[plugins.ResultType]resultSerializer{
 	plugins.ResultTypeWeb: {
 		outputType: output.TypeService,
 		getStatus:  func(_ *plugins.Result, _ *common.HostInfo) string { return "web" },
-		fillDetail: func(_ *plugins.Result, info *common.HostInfo, d map[string]interface{}) {
+		fillDetail: func(r *plugins.Result, info *common.HostInfo, d map[string]interface{}) {
 			d["is_web"] = true
 			d["port"] = info.Port
+			if r.Output == "" {
+				return
+			}
+			d["url"] = r.Output
+			if parsed, err := url.Parse(r.Output); err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") {
+				d["protocol"] = parsed.Scheme
+			}
 		},
 	},
 }

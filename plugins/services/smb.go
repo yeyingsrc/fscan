@@ -24,7 +24,9 @@ func NewSmbPlugin() *SmbPlugin {
 	}
 }
 
-func (p *SmbPlugin) Scan(ctx context.Context, info *common.HostInfo, config *common.Config, state *common.State) *plugins.Result {
+func (p *SmbPlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *plugins.Result {
+	config := session.Config
+	state := session.State
 	target := info.Target()
 
 	// 检查端口
@@ -37,23 +39,21 @@ func (p *SmbPlugin) Scan(ctx context.Context, info *common.HostInfo, config *com
 	}
 
 	// 1. 协议探测和信息收集
-	smbTarget, err := probeTarget(info.Host, info.Port, config.Timeout)
+	smbTarget, err := probeTarget(ctx, info.Host, info.Port, config.Timeout, session)
 	if err != nil {
-		state.IncrementTCPFailedPacketCount()
 		return &ScanResult{
 			Success: false,
 			Service: "smb",
 			Error:   fmt.Errorf("SMB协议探测失败: %w", err),
 		}
 	}
-	state.IncrementTCPSuccessPacketCount()
 
 	// 输出信息收集结果
 	p.logSMBInfo(target, smbTarget)
 
 	// 2. 漏洞检测 (仅SMBv2+且端口445)
 	if smbTarget.Protocol == SMBProtocol2 && info.Port == 445 {
-		if checkSMBGhost(info.Host, config.Timeout) {
+		if checkSMBGhost(ctx, info.Host, config.Timeout, session) {
 			smbTarget.Vulnerable = &SMBVuln{CVE20200796: true}
 			common.LogVuln(i18n.Tr("smbghost_vuln", target))
 		}
@@ -68,7 +68,7 @@ func (p *SmbPlugin) Scan(ctx context.Context, info *common.HostInfo, config *com
 	auth := p.getAuthenticator(smbTarget.Protocol)
 
 	// 4. 未授权访问检测
-	if result := p.testUnauthorizedAccess(ctx, info, auth, config, state); result != nil && result.Success {
+	if result := p.testUnauthorizedAccess(ctx, info, auth, config, state, session); result != nil && result.Success {
 		var successMsg string
 		if config.Credentials.Domain != "" {
 			successMsg = fmt.Sprintf("SMB %s 未授权访问 - %s\\%s:%s", target, config.Credentials.Domain, result.Username, result.Password)
@@ -90,8 +90,8 @@ func (p *SmbPlugin) Scan(ctx context.Context, info *common.HostInfo, config *com
 		creds[i] = Credential{Username: c.Username, Password: c.Password}
 	}
 
-	authFn := p.createAuthFunc(info, auth, config, state)
-	testConfig := DefaultConcurrentTestConfig(config)
+	authFn := p.createAuthFunc(info, auth, session)
+	testConfig := DefaultConcurrentTestConfigWithTarget(config, info)
 
 	result := TestCredentialsConcurrently(ctx, creds, authFn, "smb", testConfig)
 
@@ -117,20 +117,16 @@ func (p *SmbPlugin) getAuthenticator(protocol SMBProtocol) SMBAuthenticator {
 }
 
 // createAuthFunc 创建认证函数
-func (p *SmbPlugin) createAuthFunc(info *common.HostInfo, auth SMBAuthenticator, config *common.Config, state *common.State) AuthFunc {
+func (p *SmbPlugin) createAuthFunc(info *common.HostInfo, auth SMBAuthenticator, session *common.ScanSession) AuthFunc {
+	config := session.Config
 	return func(ctx context.Context, cred Credential) *AuthResult {
-		result, _ := auth.Authenticate(ctx, info.Host, info.Port, cred, config.Credentials.Domain, config.Timeout)
-		if result.Success {
-			state.IncrementTCPSuccessPacketCount()
-		} else {
-			state.IncrementTCPFailedPacketCount()
-		}
+		result, _ := auth.Authenticate(ctx, info.Host, info.Port, cred, config.Credentials.Domain, config.Timeout, session)
 		return result
 	}
 }
 
 // testUnauthorizedAccess 测试未授权访问
-func (p *SmbPlugin) testUnauthorizedAccess(ctx context.Context, info *common.HostInfo, auth SMBAuthenticator, config *common.Config, state *common.State) *ScanResult {
+func (p *SmbPlugin) testUnauthorizedAccess(ctx context.Context, info *common.HostInfo, auth SMBAuthenticator, config *common.Config, state *common.State, session *common.ScanSession) *ScanResult {
 	target := info.Target()
 
 	unauthorizedCreds := []Credential{
@@ -140,7 +136,7 @@ func (p *SmbPlugin) testUnauthorizedAccess(ctx context.Context, info *common.Hos
 	}
 
 	for _, cred := range unauthorizedCreds {
-		shareInfo, err := auth.ListShares(ctx, info.Host, info.Port, cred, config.Credentials.Domain, config.Timeout)
+		shareInfo, err := auth.ListShares(ctx, info.Host, info.Port, cred, config.Credentials.Domain, config.Timeout, session)
 		if err == nil && len(shareInfo) > 0 {
 			var output strings.Builder
 			displayUser := cred.Username
