@@ -34,7 +34,7 @@ func NewWinServicePlugin() *WinServicePlugin {
 
 // Scan 执行Windows服务持久化 - 直接实现
 func (p *WinServicePlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *plugins.Result {
-	_ = session.Config
+	config := session.Config
 	_ = session.State
 	var output strings.Builder
 

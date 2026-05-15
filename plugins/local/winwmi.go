@@ -34,7 +34,7 @@ func NewWinWMIPlugin() *WinWMIPlugin {
 
 // Scan 执行Windows WMI事件订阅持久化 - 直接实现
 func (p *WinWMIPlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *plugins.Result {
-	_ = session.Config
+	config := session.Config
 	_ = session.State
 	var output strings.Builder
 

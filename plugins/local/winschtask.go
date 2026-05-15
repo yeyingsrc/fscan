@@ -34,7 +34,7 @@ func NewWinSchTaskPlugin() *WinSchTaskPlugin {
 
 // Scan 执行Windows计划任务持久化 - 直接实现
 func (p *WinSchTaskPlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *plugins.Result {
-	_ = session.Config
+	config := session.Config
 	_ = session.State
 	var output strings.Builder
 

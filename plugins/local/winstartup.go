@@ -34,7 +34,7 @@ func NewWinStartupPlugin() *WinStartupPlugin {
 
 // Scan 执行Windows启动文件夹持久化 - 直接实现
 func (p *WinStartupPlugin) Scan(ctx context.Context, info *common.HostInfo, session *common.ScanSession) *plugins.Result {
-	_ = session.Config
+	config := session.Config
 	_ = session.State
 	var output strings.Builder
 
